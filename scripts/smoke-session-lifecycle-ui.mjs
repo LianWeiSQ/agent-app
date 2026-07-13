@@ -25,7 +25,11 @@ function freePort() {
 }
 
 function spawnLogged(command, args, options = {}) {
-  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], ...options });
+  const child = spawn(command, args, {
+    detached: process.platform !== "win32",
+    stdio: ["ignore", "pipe", "pipe"],
+    ...options,
+  });
   const output = [];
   child.stdout?.on("data", (chunk) => output.push(chunk.toString()));
   child.stderr?.on("data", (chunk) => output.push(chunk.toString()));
@@ -33,18 +37,34 @@ function spawnLogged(command, args, options = {}) {
   return child;
 }
 
+function signalChildTree(child, signal) {
+  if (process.platform !== "win32" && child.pid) {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch (error) {
+      if (!(error instanceof Error) || !Object.hasOwn(error, "code") || error.code !== "ESRCH") throw error;
+    }
+  }
+  if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+}
+
 async function stopChild(child) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child) return;
+  if (child.exitCode !== null || child.signalCode !== null) {
+    signalChildTree(child, "SIGTERM");
+    return;
+  }
   await new Promise((resolve) => {
     const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
+      signalChildTree(child, "SIGKILL");
       resolve();
     }, 2_000);
     child.once("exit", () => {
       clearTimeout(timeout);
       resolve();
     });
-    child.kill("SIGTERM");
+    signalChildTree(child, "SIGTERM");
   });
 }
 
