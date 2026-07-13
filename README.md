@@ -19,11 +19,12 @@ The core workspace remains in `../openharness` and owns:
 
 The app talks to the core through the Bridge HTTP/SSE API. During packaged builds it builds and bundles the runtime sidecar from `../openharness`.
 
-The harness/core root is configurable from the Desktop inspector. By default it
+The harness/core root is configurable from Desktop Settings. By default it
 uses `../openharness`; `OPENAGENT_CORE_ROOT` remains the process-level fallback,
 and the UI setting is passed to the managed Bridge as `coreRoot`.
 
-Product planning docs live in `docs/`, next to the app that owns them.
+The current product status and roadmap live in
+`docs/desktop-agentic-workspace-plan.md`, next to the app that owns them.
 The legacy static bridge console lives in `static/bridge-console/` for
 reference and app-side experiments; it is no longer embedded in core.
 
