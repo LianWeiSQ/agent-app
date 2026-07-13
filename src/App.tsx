@@ -13,7 +13,6 @@ import {
   GitBranch,
   GitCompare,
   History,
-  MoreHorizontal,
   PanelRight,
   PencilLine,
   Paperclip,
@@ -29,7 +28,6 @@ import {
   ShieldCheck,
   Sidebar,
   Square,
-  Target,
   Terminal,
   Trash2,
   Undo2,
@@ -596,14 +594,10 @@ type DesktopProject = {
 type SettingsPage =
   | "general"
   | "profile"
-  | "appearance"
   | "configuration"
-  | "personalization"
   | "plugins"
   | "mcp"
-  | "browser"
   | "computer"
-  | "hooks"
   | "connections"
   | "git"
   | "environment"
@@ -618,6 +612,7 @@ const STORAGE_CORE_ROOT = "openagent.desktop.coreRoot";
 const STORAGE_TOKEN = "openagent.desktop.token";
 const STORAGE_PROJECTS = "openagent.desktop.projects";
 const STORAGE_ACTIVE_PROJECT = "openagent.desktop.activeProject";
+const STORAGE_ACTIVE_SESSIONS = "openagent.desktop.activeSessions";
 const STORAGE_PERMISSION_MODE = "openagent.desktop.permissionMode";
 
 const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; model: string; wireApi: string; models: string[] }> = {
@@ -728,6 +723,51 @@ function parseProviderEnvText(input: string, current: ProviderDraft): ProviderDr
 function storedValue(key: string, fallback: string): string {
   if (typeof window === "undefined") return fallback;
   return window.localStorage.getItem(key) ?? fallback;
+}
+
+function storedActiveSessions(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(STORAGE_ACTIVE_SESSIONS) ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const sessions: Record<string, string> = {};
+    for (const [projectPath, session] of Object.entries(parsed)) {
+      if (!normalizeProjectPath(projectPath) || typeof session !== "string" || !session.trim()) continue;
+      sessions[normalizeProjectPath(projectPath)] = session.trim();
+    }
+    return sessions;
+  } catch {
+    return {};
+  }
+}
+
+function storedActiveSession(projectPath: string): string {
+  return storedActiveSessions()[normalizeProjectPath(projectPath)] ?? "";
+}
+
+function persistActiveSession(projectPath: string, session: string): void {
+  if (typeof window === "undefined") return;
+  const normalizedProject = normalizeProjectPath(projectPath);
+  if (!normalizedProject) return;
+  const sessions = storedActiveSessions();
+  if (session.trim()) {
+    sessions[normalizedProject] = session.trim();
+  } else {
+    delete sessions[normalizedProject];
+  }
+  window.localStorage.setItem(STORAGE_ACTIVE_SESSIONS, JSON.stringify(sessions));
+}
+
+function forgetStoredSession(session: string): void {
+  if (typeof window === "undefined" || !session.trim()) return;
+  const sessions = storedActiveSessions();
+  let changed = false;
+  for (const [projectPath, storedSession] of Object.entries(sessions)) {
+    if (storedSession !== session) continue;
+    delete sessions[projectPath];
+    changed = true;
+  }
+  if (changed) window.localStorage.setItem(STORAGE_ACTIVE_SESSIONS, JSON.stringify(sessions));
 }
 
 function normalizePermissionMode(value?: string | null): string {
@@ -2548,6 +2588,7 @@ function questionValidationErrors(question: JsonRecord | undefined, requestId: s
 }
 
 function eventIcon(method: string) {
+  if (method === "turn/retrying" || method === "turn/fallback") return <RefreshCw size={16} />;
   if (method.includes("toolCall")) return <Wrench size={16} />;
   if (method.includes("question")) return <Bot size={16} />;
   if (method.includes("approval")) return <ShieldCheck size={16} />;
@@ -2574,6 +2615,8 @@ function streamStateAfterEvents(events: AppEvent[], fallback: string): string {
     if (event.method === "turn/completed") return "idle";
     if (event.method === "turn/failed") return "failed";
     if (event.method === "turn/interrupted") return "interrupted";
+    if (event.method === "turn/retrying") return "retrying";
+    if (event.method === "turn/fallback") return "running";
     if (event.method === "turn/approval_requested") return "waiting_approval";
     if (event.method === "item/question/requested") return "waiting_question";
     if (event.method === "turn/approval_resolved" || event.method === "item/question/resolved") {
@@ -2599,6 +2642,8 @@ function activeTurnIdFromEvents(events: AppEvent[]): string {
       turnId &&
       (event.method === "item/agentMessage/delta" ||
         event.method === "item/agentMessage/thinking" ||
+        event.method === "turn/retrying" ||
+        event.method === "turn/fallback" ||
         event.method === "item/toolCall/started" ||
         event.method === "turn/approval_requested" ||
         event.method === "item/question/requested")
@@ -2615,6 +2660,30 @@ function activeTurnIdFromEvents(events: AppEvent[]): string {
     }
   }
   return activeTurnId;
+}
+
+type RetryableTurnFailure = {
+  turnId: string;
+  message: string;
+  retryable: boolean;
+  resumable: boolean;
+};
+
+function latestRetryableTurnFailure(events: AppEvent[]): RetryableTurnFailure | null {
+  for (const event of [...events].reverse()) {
+    if (event.method === "turn/completed" || event.method === "turn/interrupted") return null;
+    if (event.method !== "turn/failed") continue;
+    const turnId = eventTurnId(event);
+    if (!turnId) return null;
+    const params = event.params ?? {};
+    return {
+      turnId,
+      message: stringParam(params, "error"),
+      retryable: params.retryable === true,
+      resumable: params.resumable === true,
+    };
+  }
+  return null;
 }
 
 function latestTerminalErrorTurnIdFromEvents(events: AppEvent[]): string {
@@ -2747,6 +2816,8 @@ function isVisibleProcessEvent(event: AppEvent): boolean {
     method.includes("approval") ||
     method.includes("question") ||
     method.includes("patch") ||
+    method === "turn/retrying" ||
+    method === "turn/fallback" ||
     method === "turn/failed" ||
     method === "turn/interrupted"
   );
@@ -2815,7 +2886,9 @@ export function App() {
   const [sessionMessages, setSessionMessages] = useState<SessionMessagesPayload | null>(null);
   const [turnJobs, setTurnJobs] = useState<TurnJobsPayload>({ turns: [], count: 0, running_count: 0, terminal_count: 0 });
   const [selectedTurnJobId, setSelectedTurnJobId] = useState("");
-  const [activeSessionId, setActiveSessionId] = useState("");
+  const [activeSessionId, setActiveSessionId] = useState(() =>
+    storedActiveSession(storedValue(STORAGE_ACTIVE_PROJECT, "")),
+  );
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [prompt, setPrompt] = useState("");
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
@@ -2838,6 +2911,7 @@ export function App() {
   const [streamState, setStreamState] = useState("idle");
   const [activeTurnId, setActiveTurnId] = useState("");
   const [interruptingTurnId, setInterruptingTurnId] = useState("");
+  const [retryingTurnId, setRetryingTurnId] = useState("");
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [streamHealth, setStreamHealth] = useState<StreamHealth>({
     status: "idle",
@@ -2869,6 +2943,8 @@ export function App() {
   const refreshEffectKey = useRef("");
   const streamReconnectAttempts = useRef(0);
   const managedBridgeAutoSyncKey = useRef("");
+  const activeSessionIdRef = useRef(activeSessionId);
+  const sessionViewEpochRef = useRef(0);
   const sessionRenameCancelledRef = useRef(false);
   const composerComposingRef = useRef(false);
   const composerCompositionEndAtRef = useRef(0);
@@ -3248,7 +3324,7 @@ export function App() {
   }, []);
 
   const refreshWorkspaceContext = useCallback(
-    async (focusPath = "") => {
+    async (focusPath = "", expectedEpoch?: number) => {
       const normalizedPath = focusPath.trim();
       const previewPath = normalizedPath ? `?path=${encodeURIComponent(normalizedPath)}&content=true` : "?depth=2";
       const [treePayload, previewPayload, gitPayload] = await Promise.all([
@@ -3256,6 +3332,7 @@ export function App() {
         api<FilesPayload>(`/api/files${previewPath}`),
         api<GitPayload>("/api/git"),
       ]);
+      if (expectedEpoch !== undefined && sessionViewEpochRef.current !== expectedEpoch) return;
       setFileTree(treePayload);
       setFilePreview(previewPayload);
       setGitStatus(gitPayload);
@@ -3278,28 +3355,44 @@ export function App() {
     setAttachmentError("");
   }, []);
 
+  const activateSession = useCallback(
+    (session: string, projectPath = selectedProjectPath) => {
+      sessionViewEpochRef.current += 1;
+      activeSessionIdRef.current = session;
+      setActiveSessionId(session);
+      persistActiveSession(projectPath, session);
+      resetSessionView();
+      return sessionViewEpochRef.current;
+    },
+    [resetSessionView, selectedProjectPath],
+  );
+
   const clearMissingSession = useCallback(
     (session: string) => {
       if (!session) return;
       clearSessionListErrors();
       setSessions((current) => current.filter((record) => sessionId(record) !== session));
-      if (activeSessionId !== session) return;
-      setActiveSessionId("");
-      resetSessionView();
+      forgetStoredSession(session);
+      if (activeSessionIdRef.current !== session) return;
+      activateSession("");
     },
-    [activeSessionId, clearSessionListErrors, resetSessionView],
+    [activateSession, activeSessionId, clearSessionListErrors],
   );
 
   const refreshSessionMessages = useCallback(
-    async (session: string) => {
+    async (session: string, expectedEpoch = sessionViewEpochRef.current) => {
       if (!session) {
-        setSessionMessages(null);
+        if (activeSessionIdRef.current === "" && sessionViewEpochRef.current === expectedEpoch) {
+          setSessionMessages(null);
+        }
         return;
       }
       try {
         const payload = await api<SessionMessagesPayload>(`/api/sessions/${session}/messages?limit=100`);
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         setSessionMessages({ ...payload, session_id: payload.session_id || session });
       } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         if (isMissingSessionError(err)) {
           clearMissingSession(session);
           return;
@@ -3341,11 +3434,12 @@ export function App() {
   }, [api]);
 
   const refreshSessionTrust = useCallback(
-    async (session: string) => {
+    async (session: string, expectedEpoch = sessionViewEpochRef.current) => {
       if (!session) {
+        if (activeSessionIdRef.current !== "" || sessionViewEpochRef.current !== expectedEpoch) return;
         setSessionDiff(null);
         setCheckpoints(null);
-        await refreshWorkspaceContext();
+        await refreshWorkspaceContext("", expectedEpoch);
         return;
       }
       try {
@@ -3353,13 +3447,15 @@ export function App() {
           api<SessionDiff>(`/api/sessions/${session}/diff`),
           api<CheckpointsPayload>(`/api/sessions/${session}/checkpoints`),
         ]);
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         setSessionDiff(diffPayload);
         setCheckpoints(checkpointsPayload);
-        await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"));
+        await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"), expectedEpoch);
       } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         if (isMissingSessionError(err)) {
           clearMissingSession(session);
-          await refreshWorkspaceContext();
+          await refreshWorkspaceContext("", expectedEpoch);
           return;
         }
         throw err;
@@ -3369,6 +3465,7 @@ export function App() {
   );
 
   const refresh = useCallback(async () => {
+    const expectedEpoch = sessionViewEpochRef.current;
     setError("");
     clearSessionListErrors();
     const [protocolPayload, providerPayload, mcpPayload, sessionsPayload, approvalsPayload, questionsPayload, turnJobsPayload] = await Promise.all([
@@ -3403,6 +3500,7 @@ export function App() {
         error: userFacingErrorMessage(err),
       })),
     ]);
+    if (sessionViewEpochRef.current !== expectedEpoch) return;
     setProtocol(protocolPayload);
     setProvider(providerPayload);
     setMcp(mcpPayload);
@@ -3413,19 +3511,28 @@ export function App() {
     setModel((current) => current || providerPayload.model || "");
     const records = sessionsPayload.sessions ?? [];
     setSessions(records);
-    setActiveSessionId((current) => {
-      const currentRecord = records.find((session) => sessionId(session) === current);
-      if (
-        currentRecord &&
-        (!selectedProjectPath || !currentRecord.workspace || sameProjectPath(currentRecord.workspace, selectedProjectPath))
-      ) {
-        return current;
+    const current = activeSessionIdRef.current;
+    const currentRecord = records.find((session) => sessionId(session) === current);
+    const currentIsValid = Boolean(
+      currentRecord &&
+        (!selectedProjectPath || !currentRecord.workspace || sameProjectPath(currentRecord.workspace, selectedProjectPath)),
+    );
+    if (!currentIsValid) {
+      const stored = storedActiveSession(selectedProjectPath);
+      const storedRecord = records.find((session) => sessionId(session) === stored);
+      const storedIsValid = Boolean(
+        storedRecord &&
+          (!selectedProjectPath || !storedRecord.workspace || sameProjectPath(storedRecord.workspace, selectedProjectPath)),
+      );
+      if (storedIsValid) {
+        activateSession(stored, selectedProjectPath);
+      } else if (current) {
+        activateSession("", selectedProjectPath);
       }
-      return "";
-    });
-    await refreshWorkspaceContext();
+    }
+    await refreshWorkspaceContext("", sessionViewEpochRef.current);
     setConnection("online");
-  }, [api, clearSessionListErrors, refreshWorkspaceContext, selectedProjectPath]);
+  }, [activateSession, api, clearSessionListErrors, refreshWorkspaceContext, selectedProjectPath]);
 
   const createSession = useCallback(async () => {
     if (bridgeSwitchInProgress) {
@@ -3442,10 +3549,9 @@ export function App() {
     const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
     const session = createdSessionSummary(payload, workspace ?? selectedProjectPath);
     if (session) setSessions((current) => upsertSessionSummary(current, session));
-    resetSessionView();
-    setActiveSessionId(id);
+    activateSession(id, workspace ?? selectedProjectPath);
     return id;
-  }, [api, bridgeSwitchInProgress, clearSessionListErrors, resetSessionView, selectedProjectPath]);
+  }, [activateSession, api, bridgeSwitchInProgress, clearSessionListErrors, selectedProjectPath]);
 
 	  const beginRenameSession = useCallback((session: SessionSummary) => {
 	    const id = sessionId(session);
@@ -3519,19 +3625,19 @@ export function App() {
 
       setSessionDeleteBusy(id);
       clearSessionListErrors();
+      const deletingActive = activeSessionIdRef.current === id;
+      const deletingWorkspace = session.workspace || selectedProjectPath;
+      if (deletingActive) activateSession("", deletingWorkspace);
       try {
         await api(`/api/sessions/${encodeURIComponent(id)}`, {
           method: "DELETE",
         });
+        forgetStoredSession(id);
         setSessions((current) => current.filter((record) => sessionId(record) !== id));
         setDeleteConfirmationSessionId("");
         if (renamingSessionId === id) {
           setRenamingSessionId("");
           setSessionRenameDraft("");
-        }
-        if (activeSessionId === id) {
-          setActiveSessionId("");
-          resetSessionView();
         }
         await refresh();
       } catch (err) {
@@ -3541,21 +3647,22 @@ export function App() {
           refresh().catch(() => undefined);
           return;
         }
+        if (deletingActive) activateSession(id, deletingWorkspace);
         setSessionDeleteError("删除失败，请刷新后重试。");
       } finally {
         setSessionDeleteBusy("");
       }
     },
     [
-      activeSessionId,
       api,
       clearMissingSession,
       clearSessionListErrors,
       deleteConfirmationSessionId,
       refresh,
-      resetSessionView,
+      activateSession,
       renamingSessionId,
       sessionDeleteBusy,
+      selectedProjectPath,
     ],
   );
 
@@ -3572,9 +3679,9 @@ export function App() {
         });
         const updated = payload.session ?? { ...session, archived, archived_at_ms: archived ? Date.now() : null };
         setSessions((current) => current.map((record) => (sessionId(record) === id ? updated : record)));
+        if (archived) forgetStoredSession(id);
         if (archived && activeSessionId === id) {
-          setActiveSessionId("");
-          resetSessionView();
+          activateSession("");
         }
         await refresh();
       } catch (err) {
@@ -3594,7 +3701,7 @@ export function App() {
       clearMissingSession,
       clearSessionListErrors,
       refresh,
-      resetSessionView,
+      activateSession,
       sessionArchiveBusy,
     ],
   );
@@ -3609,8 +3716,9 @@ export function App() {
       const sessionChanged = methods.some(sessionEventChanged);
       const restoredId = restoredCheckpointIdFromEvents(incoming);
       if (restoredId) setRestoredCheckpointId(restoredId);
-      const activeTouched = activeSessionId
-        ? touchedSessions.size === 0 || touchedSessions.has(activeSessionId)
+      const currentSession = activeSessionIdRef.current;
+      const activeTouched = currentSession
+        ? touchedSessions.size === 0 || touchedSessions.has(currentSession)
         : false;
       const tasks: Array<Promise<unknown>> = [];
 
@@ -3619,19 +3727,20 @@ export function App() {
       if (sessionChanged) tasks.push(api<{ sessions?: SessionSummary[] }>("/api/sessions").then((payload) => {
         const records = payload.sessions ?? [];
         setSessions(records);
-        if (!activeSessionId && touchedSessions.size > 0) {
+        if (!activeSessionIdRef.current && touchedSessions.size > 0) {
           const touched = records.find((session) => touchedSessions.has(sessionId(session)));
           const touchedId = sessionId(touched ?? {});
           if (touchedId) {
-            setActiveSessionId(touchedId);
-            void refreshSessionMessages(touchedId);
-            void refreshSessionTrust(touchedId);
+            const epoch = activateSession(touchedId, touched?.workspace || selectedProjectPath);
+            void refreshSessionMessages(touchedId, epoch);
+            void refreshSessionTrust(touchedId, epoch);
           }
         }
       }));
       if (activeTouched && sessionChanged) {
-        tasks.push(refreshSessionMessages(activeSessionId));
-        tasks.push(refreshSessionTrust(activeSessionId));
+        const epoch = sessionViewEpochRef.current;
+        tasks.push(refreshSessionMessages(currentSession, epoch));
+        tasks.push(refreshSessionTrust(currentSession, epoch));
       }
 
       if (tasks.length === 0) return;
@@ -3645,12 +3754,13 @@ export function App() {
       }
     },
     [
-      activeSessionId,
+      activateSession,
       api,
       refreshInteractions,
       refreshSessionMessages,
       refreshSessionTrust,
       refreshTurnJobs,
+      selectedProjectPath,
     ],
   );
   const refreshFromEventsRef = useRef(refreshFromEvents);
@@ -4226,6 +4336,7 @@ export function App() {
     return null;
   }, [activeEvents, activeMessages, activeStreamingDraft, rawStreamingDraft]);
   const latestTerminalErrorTurnId = useMemo(() => latestTerminalErrorTurnIdFromEvents(activeEvents), [activeEvents]);
+  const retryableTurnFailure = useMemo(() => latestRetryableTurnFailure(activeEvents), [activeEvents]);
   const visibleLiveTurnId =
     eventActiveTurnId || activeTurnId || liveFinalAnswer?.turnId || rawStreamingDraft?.turnId || latestTerminalErrorTurnId || "";
   const visibleLiveEvents = useMemo(() => {
@@ -4238,6 +4349,54 @@ export function App() {
       })
       .slice(-10);
   }, [activeEvents, visibleLiveTurnId]);
+  const retryFailedTurn = useCallback(async () => {
+    const failed = retryableTurnFailure;
+    if (!failed || retryingTurnId) return;
+    setRetryingTurnId(failed.turnId);
+    setError("");
+    setStreamState("retrying");
+    try {
+      const payload = await api<{
+        events?: AppEvent[];
+        status?: string;
+        turn_id?: string;
+        queued?: boolean;
+        queue_position?: number;
+        queue_reason?: string;
+      }>(`/api/turns/${failed.turnId}/retry`, { method: "POST" });
+      const incoming = payload.events ?? [];
+      const accepted = addEvents(incoming);
+      if (payload.turn_id) {
+        setActiveTurnId(payload.turn_id);
+        setTurnJobs((current) =>
+          upsertTurnJob(current, {
+            session_id: activeSessionId,
+            turn_id: payload.turn_id,
+            status: payload.status ?? (payload.queued ? "queued" : "running"),
+            queue_position: payload.queue_position,
+            queue_reason: payload.queue_reason,
+            started_at_ms: Date.now(),
+            updated_at_ms: Date.now(),
+          }),
+        );
+      }
+      setStreamState(
+        streamStateAfterEvents(
+          accepted.length ? accepted : incoming,
+          turnSubmitState(payload.status, payload.queued),
+        ),
+      );
+      window.setTimeout(() => {
+        refreshTurnJobs().catch(() => undefined);
+        if (activeSessionId) refreshSessionMessages(activeSessionId).catch(() => undefined);
+      }, 250);
+    } catch (err) {
+      setStreamState("failed");
+      setError(userFacingErrorMessage(err));
+    } finally {
+      setRetryingTurnId("");
+    }
+  }, [activeSessionId, addEvents, api, refreshSessionMessages, refreshTurnJobs, retryableTurnFailure, retryingTurnId]);
   const timelineMessageItems = useMemo(
     () => activeMessages.map((message, index) => ({ message, index })),
     [activeMessages],
@@ -4463,9 +4622,7 @@ export function App() {
       items: [
         { id: "general", label: "常规", icon: <Settings size={15} />, keywords: "general permission model mode 权限 模型" },
         { id: "profile", label: "个人资料", icon: <Bot size={15} />, keywords: "profile account user 账号" },
-        { id: "appearance", label: "外观", icon: <Circle size={15} />, keywords: "appearance theme display 外观 主题" },
         { id: "configuration", label: "配置", icon: <Database size={15} />, keywords: "configuration provider bridge token 配置" },
-        { id: "personalization", label: "个性化", icon: <Target size={15} />, keywords: "personalization instructions goal 个性化" },
         { id: "plugins", label: "插件", icon: <PlugZap size={15} />, keywords: "plugins apps tools 插件" },
       ],
     },
@@ -4473,14 +4630,12 @@ export function App() {
       title: "集成",
       items: [
         { id: "mcp", label: "MCP 服务器", icon: <Wrench size={15} />, keywords: "mcp servers tools lifecycle" },
-        { id: "browser", label: "浏览器", icon: <Search size={15} />, keywords: "browser web 浏览器" },
         { id: "computer", label: "电脑操控", icon: <Terminal size={15} />, keywords: "computer control terminal 电脑" },
       ],
     },
     {
       title: "编码",
       items: [
-        { id: "hooks", label: "钩子", icon: <GitBranch size={15} />, keywords: "hooks automation 钩子" },
         { id: "connections", label: "连接", icon: <Radio size={15} />, keywords: "connection bridge auth url 连接" },
         { id: "git", label: "Git", icon: <GitBranch size={15} />, keywords: "git diff branch changes" },
         { id: "environment", label: "环境", icon: <Terminal size={15} />, keywords: "environment harness runtime terminal 环境" },
@@ -4537,6 +4692,8 @@ export function App() {
   const conversationPhaseLabel =
     streamState === "queued"
       ? "排队中"
+      : streamState === "retrying"
+        ? "模型重试中"
       : streamState === "running" || streamState === "streaming"
       ? "正在思考"
       : streamState === "waiting_approval"
@@ -4545,14 +4702,26 @@ export function App() {
           ? "等待回答"
           : streamState === "interrupted"
             ? "已中断"
+            : streamState === "failed"
+              ? "运行失败"
           : activeSessionId
             ? "可以继续发这段"
             : "新任务";
   const isTurnInterruptible =
     Boolean(activeTurnId) &&
-    ["queued", "running", "streaming", "waiting_approval", "waiting_question"].includes(streamState);
+    ["queued", "running", "streaming", "retrying", "waiting_approval", "waiting_question"].includes(streamState);
   const interruptBusy = Boolean(interruptingTurnId);
   const canRetryPrompt = Boolean(error && prompt.trim() && !bridgeSwitchInProgress && !interruptBusy);
+  const canRetryFailedTurn = Boolean(
+    retryableTurnFailure?.retryable &&
+      retryableTurnFailure.resumable &&
+      !retryingTurnId &&
+      !bridgeSwitchInProgress &&
+      !interruptBusy,
+  );
+  const failedTurnMessage = retryableTurnFailure?.message
+    ? userFacingErrorMessage(new Error(retryableTurnFailure.message))
+    : "";
   const activityStartedAtMs = latestTurnStartedAtMs || latestUserActivity?.created_at_ms || activeSession?.updated_at_ms;
   const activityElapsedLabel = activeSessionId ? formatElapsed(activityStartedAtMs, nowMs) : "";
   const activityTitle = latestUserActivity
@@ -4804,13 +4973,16 @@ export function App() {
     setActiveProjectPath(nextProject.path);
     setProjectPathInput(nextProject.path);
     setProjectError("");
-    setActiveSessionId("");
-    resetSessionView();
+    const stored = storedActiveSession(nextProject.path);
+    const restorable = sessions.find(
+      (session) => sessionId(session) === stored && !isArchivedSession(session) && sameProjectPath(session.workspace, nextProject.path),
+    );
+    activateSession(restorable ? stored : "", nextProject.path);
     setFileTree(null);
     setFilePreview(null);
     setGitStatus(null);
     syncManagedBridgeToWorkspace(nextProject.path);
-  }, [clearSessionListErrors, resetSessionView, syncManagedBridgeToWorkspace]);
+  }, [activateSession, clearSessionListErrors, sessions, syncManagedBridgeToWorkspace]);
 
   const selectProjectSession = useCallback(
     (project: DesktopProject, session: SessionSummary) => {
@@ -4828,17 +5000,16 @@ export function App() {
       setActiveProjectPath(nextProject.path);
       setProjectPathInput(nextProject.path);
       setProjectError("");
-      resetSessionView();
-      setActiveSessionId(id);
+      const epoch = activateSession(id, nextProject.path);
       syncManagedBridgeToWorkspace(nextProject.path);
-      refreshSessionMessages(id).catch((err: unknown) => {
+      refreshSessionMessages(id, epoch).catch((err: unknown) => {
         if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
       });
-      refreshSessionTrust(id).catch((err: unknown) => {
+      refreshSessionTrust(id, epoch).catch((err: unknown) => {
         if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
       });
     },
-    [clearSessionListErrors, refreshSessionMessages, refreshSessionTrust, resetSessionView, syncManagedBridgeToWorkspace],
+    [activateSession, clearSessionListErrors, refreshSessionMessages, refreshSessionTrust, syncManagedBridgeToWorkspace],
   );
 
   const createProjectSession = useCallback(
@@ -4851,8 +5022,7 @@ export function App() {
       setProjects((current) => upsertProject(current, nextProject));
       setActiveProjectPath(nextProject.path);
       setProjectPathInput(nextProject.path);
-      setActiveSessionId("");
-      resetSessionView();
+      activateSession("", nextProject.path);
       setFileTree(null);
       setFilePreview(null);
       setGitStatus(null);
@@ -4867,15 +5037,14 @@ export function App() {
         const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
         const session = createdSessionSummary(payload, nextProject.path);
         if (session) setSessions((current) => upsertSessionSummary(current, session));
-        resetSessionView();
-        setActiveSessionId(id);
+        activateSession(id, nextProject.path);
       } catch (err) {
         setProjectError(userFacingErrorMessage(err));
       } finally {
         setProjectBusy("");
       }
     },
-    [api, clearSessionListErrors, resetSessionView, syncManagedBridgeToWorkspace],
+    [activateSession, api, clearSessionListErrors, syncManagedBridgeToWorkspace],
   );
 
   const removeProject = useCallback(
@@ -4899,8 +5068,11 @@ export function App() {
       setActiveProjectPath(fallbackPath);
       setProjectPathInput(fallbackPath);
       if (!fallbackPath) window.localStorage.removeItem(STORAGE_ACTIVE_PROJECT);
-      setActiveSessionId("");
-      resetSessionView();
+      const stored = storedActiveSession(fallbackPath);
+      const restorable = sessions.find(
+        (session) => sessionId(session) === stored && !isArchivedSession(session) && sameProjectPath(session.workspace, fallbackPath),
+      );
+      activateSession(restorable ? stored : "", fallbackPath);
       setFileTree(null);
       setFilePreview(null);
       setGitStatus(null);
@@ -4908,10 +5080,11 @@ export function App() {
     },
     [
       activeProjectPath,
+      activateSession,
       clearSessionListErrors,
       projectPathInput,
       projects,
-      resetSessionView,
+      sessions,
       selectedProjectPath,
       syncManagedBridgeToWorkspace,
     ],
@@ -4922,13 +5095,12 @@ export function App() {
     setProjects((current) => upsertProject(current, project));
     setActiveProjectPath(project.path);
     setProjectPathInput(project.path);
-    setActiveSessionId("");
-    resetSessionView();
+    activateSession("", project.path);
     setFileTree(null);
     setFilePreview(null);
     setGitStatus(null);
     syncManagedBridgeToWorkspace(project.path);
-  }, [clearSessionListErrors, resetSessionView, syncManagedBridgeToWorkspace]);
+  }, [activateSession, clearSessionListErrors, syncManagedBridgeToWorkspace]);
 
   const addProject = useCallback(
     async (event: FormEvent) => {
@@ -5104,32 +5276,7 @@ export function App() {
             <section className="settings-section">
               <div className="settings-section-heading">
                 <h2>常规</h2>
-                <p>控制默认工作方式、模型和权限策略。</p>
-              </div>
-              <div className="settings-option-grid two">
-                <button className="settings-choice selected" type="button">
-                  <Terminal size={18} />
-                  <span>
-                    <strong>适用于编程</strong>
-                    <small>更多技术细节、工具调用和控制。</small>
-                  </span>
-                  <span className="settings-radio selected" />
-                </button>
-                <button className="settings-choice" type="button">
-                  <Bot size={18} />
-                  <span>
-                    <strong>适用于日常工作</strong>
-                    <small>更少细节，偏向简洁回答。</small>
-                  </span>
-                  <span className="settings-radio" />
-                </button>
-              </div>
-            </section>
-
-            <section className="settings-section">
-              <div className="settings-section-heading compact">
-                <h3>模型</h3>
-                <p>当前会话默认使用的模型。</p>
+                <p>设置当前会话使用的模型和默认权限策略。</p>
               </div>
               <label className="settings-row-control">
                 <span>
@@ -5944,74 +6091,6 @@ export function App() {
           </div>
         );
 
-      case "appearance":
-        return (
-          <div className="settings-content-grid">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <h2>外观</h2>
-                <p>当前界面使用 Codex-like 的紧凑阅读布局。</p>
-              </div>
-              <div className="settings-option-grid two">
-                <button className="settings-choice selected" type="button">
-                  <Circle size={18} />
-                  <span>
-                    <strong>浅色</strong>
-                    <small>低噪声白底，适合长时间阅读。</small>
-                  </span>
-                  <span className="settings-radio selected" />
-                </button>
-                <button className="settings-choice" disabled type="button">
-                  <Circle size={18} />
-                  <span>
-                    <strong>深色</strong>
-                    <small>待接入系统主题。</small>
-                  </span>
-                  <span className="settings-radio" />
-                </button>
-              </div>
-              <div className="settings-toggle-list">
-                <div className="settings-toggle-row selected">
-                  <span>
-                    <strong>工具过程默认折叠</strong>
-                    <small>主对话区优先展示用户问题和最终回复。</small>
-                  </span>
-                  <span className="settings-switch on" />
-                </div>
-                <div className="settings-toggle-row selected">
-                  <span>
-                    <strong>Sidebar 仅显示项目和会话</strong>
-                    <small>隐藏 session id、turn id、队列杂项。</small>
-                  </span>
-                  <span className="settings-switch on" />
-                </div>
-              </div>
-            </section>
-          </div>
-        );
-
-      case "personalization":
-        return (
-          <div className="settings-content-grid">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <h2>个性化</h2>
-                <p>Composer 的目标/计划能力尚未正式启用，入口保持隐藏。</p>
-              </div>
-              <dl className="settings-definition-grid">
-                <dt>Default model</dt>
-                <dd>{model || provider?.model || "-"}</dd>
-                <dt>Permission</dt>
-                <dd>{permission}</dd>
-                <dt>Goal mode</dt>
-                <dd>未启用</dd>
-                <dt>Plan mode</dt>
-                <dd>未启用</dd>
-              </dl>
-            </section>
-          </div>
-        );
-
       case "archived":
         return (
           <div className="settings-content-grid">
@@ -6057,14 +6136,12 @@ export function App() {
             <section className="settings-section">
               <div className="settings-section-heading">
                 <h2>插件</h2>
-                <p>把工具、MCP、浏览器和本机控制从主界面拆到独立配置入口。</p>
+                <p>管理已经接通的 MCP 与本机工具入口。</p>
               </div>
               <div className="settings-list">
                 {[
                   { label: "MCP 服务器", description: "管理 server、transport、lifecycle 和工具发现。", page: "mcp" as SettingsPage, icon: <Wrench size={15} /> },
-                  { label: "浏览器", description: "Web/浏览器集成状态。", page: "browser" as SettingsPage, icon: <Search size={15} /> },
                   { label: "电脑操控", description: "本地终端和电脑操控能力。", page: "computer" as SettingsPage, icon: <Terminal size={15} /> },
-                  { label: "钩子", description: "任务生命周期自动化。", page: "hooks" as SettingsPage, icon: <GitBranch size={15} /> },
                 ].map(({ label, description, page, icon }) => (
                   <div className="settings-list-row" key={page}>
                     {icon}
@@ -6082,65 +6159,8 @@ export function App() {
           </div>
         );
 
-      case "browser":
-        return (
-          <div className="settings-content-grid">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <h2>浏览器</h2>
-                <p>浏览器能力保留为集成页，不再占用主对话或 Inspector。</p>
-              </div>
-              <dl className="settings-definition-grid">
-                <dt>Status</dt>
-                <dd>未连接</dd>
-                <dt>Bridge</dt>
-                <dd>{bridgeUrl}</dd>
-                <dt>Workspace</dt>
-                <dd title={selectedProjectPath}>{compactPath(selectedProjectPath)}</dd>
-              </dl>
-            </section>
-          </div>
-        );
-
-      case "hooks":
-        return (
-          <div className="settings-content-grid">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <h2>钩子</h2>
-                <p>任务生命周期钩子目前默认关闭，后续从这里启用。</p>
-              </div>
-              <div className="settings-toggle-list">
-                {["turn.started", "tool.started", "tool.completed", "turn.completed"].map((hook) => (
-                  <div className="settings-toggle-row" key={hook}>
-                    <span>
-                      <strong>{hook}</strong>
-                      <small>未启用</small>
-                    </span>
-                    <span className="settings-switch" />
-                  </div>
-                ))}
-              </div>
-            </section>
-          </div>
-        );
-
       default:
-        return (
-          <div className="settings-content-grid">
-            <section className="settings-section">
-              <div className="settings-section-heading">
-                <h2>{settingsPageLabel}</h2>
-                <p>该配置页当前没有可操作项。</p>
-              </div>
-              <div className="settings-empty-panel">
-                <Settings size={22} />
-                <strong>{settingsPageLabel}</strong>
-                <span>没有可显示的配置。</span>
-              </div>
-            </section>
-          </div>
-        );
+        return null;
     }
   })();
 
@@ -6208,16 +6228,12 @@ export function App() {
             <PencilLine size={17} />
             <span>新对话</span>
           </button>
-          <button className="nav-action" type="button">
-            <Search size={17} />
-            <span>搜索</span>
-          </button>
-          <button className="nav-action" type="button">
+          <button className="nav-action" onClick={openOverviewPanel} type="button" title="查看待处理事项">
             <History size={17} />
             <span>已安排</span>
             {pendingInteractionCount ? <b>{pendingInteractionCount}</b> : null}
           </button>
-          <button className="nav-action" type="button">
+          <button className="nav-action" onClick={() => openSettingsPage("plugins")} type="button" title="打开插件设置">
             <PlugZap size={17} />
             <span>插件</span>
           </button>
@@ -6440,9 +6456,6 @@ export function App() {
               <Sidebar size={16} />
             </div>
             <h1>{activeSession?.title || activeProjectLabel || "OpenAgent"}</h1>
-            <button className="chrome-button ghost" type="button" title="More">
-              <MoreHorizontal size={17} />
-            </button>
           </div>
           <div className="topbar-actions">
             <button
@@ -6461,7 +6474,12 @@ export function App() {
             >
               <Square size={15} />
             </button>
-            <button className={`chrome-button topbar-state ${statusClass(streamState)}`} type="button" title={streamState}>
+            <button
+              className={`chrome-button topbar-state ${statusClass(streamState)}`}
+              onClick={openOverviewPanel}
+              type="button"
+              title={`运行状态：${conversationPhaseLabel}`}
+            >
               <Activity size={15} />
             </button>
             <button
@@ -6781,10 +6799,16 @@ export function App() {
                 </button>
               ) : null}
             </div>
-            {error ? (
+            {error || failedTurnMessage ? (
               <div className="error-line">
-                <span>{error}</span>
-                {canRetryPrompt ? <button type="submit">重试</button> : null}
+                <span>{error || failedTurnMessage}</span>
+                {canRetryFailedTurn ? (
+                  <button disabled={Boolean(retryingTurnId)} onClick={retryFailedTurn} type="button">
+                    {retryingTurnId ? "重试中" : "重试任务"}
+                  </button>
+                ) : canRetryPrompt ? (
+                  <button type="submit">重试</button>
+                ) : null}
               </div>
             ) : null}
           </form>
@@ -6948,7 +6972,9 @@ export function App() {
                     onClick={() => {
                       setSelectedTurnJobId(id);
                       const sessionIdForJob = turnJobSessionId(job);
-                      if (sessionIdForJob) setActiveSessionId(sessionIdForJob);
+                      if (sessionIdForJob) {
+                        activateSession(sessionIdForJob, session?.workspace || selectedProjectPath);
+                      }
                     }}
                     type="button"
                   >
@@ -7181,6 +7207,8 @@ function toolCallStatusLabel(status: string): string {
 
 function processEventTitle(event: AppEvent): string {
   const method = event.method;
+  if (method === "turn/retrying") return "模型请求重试";
+  if (method === "turn/fallback") return "已切换备用模型";
   if (method === "item/agentMessage/thinking") return "正在思考";
   if (method.includes("toolCall")) return "工具调用";
   if (method.includes("approval")) return "权限确认";
@@ -7198,6 +7226,7 @@ function processEventStatus(event: AppEvent): string {
   if (status === "completed") return "已完成";
   if (status === "failed") return "失败";
   if (status === "running") return "正在运行";
+  if (status === "retrying") return "正在重试";
   if (status === "thinking") return "正在思考";
   if (status === "pending") return "待处理";
   return status;
@@ -7205,6 +7234,15 @@ function processEventStatus(event: AppEvent): string {
 
 function processEventSummary(event: AppEvent): string {
   const params = event.params ?? {};
+  if (event.method === "turn/retrying") {
+    const attempt = Number(params.attempt ?? 0);
+    const maxAttempts = Number(params.max_attempts ?? 0);
+    const model = stringParam(params, "model");
+    return `${model || "当前模型"} · 第 ${attempt || "?"}/${maxAttempts || "?"} 次请求`;
+  }
+  if (event.method === "turn/fallback") {
+    return `${stringParam(params, "from_model") || "主模型"} → ${stringParam(params, "to_model") || "备用模型"}`;
+  }
   if (event.method.includes("toolCall")) {
     return firstText(params.name, params.tool_name, params.tool, params.command, "工具");
   }

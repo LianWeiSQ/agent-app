@@ -6,8 +6,12 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc && vite build",
+    "check:p0": "node scripts/check-p0.mjs",
+    "ci:p0": "node scripts/ci-p0.mjs",
     "preview": "vite preview --host 127.0.0.1",
     "smoke:streaming": "node scripts/smoke-real-streaming.mjs",
+    "smoke:session-lifecycle": "node scripts/smoke-session-lifecycle-ui.mjs",
+    "smoke:provider-recovery": "node scripts/smoke-provider-recovery-ui.mjs",
     "smoke:streaming:sub2api": "node scripts/smoke-real-streaming.mjs --provider=real --model=gpt-5.5",
     "smoke:local-mcp-ui": "node scripts/smoke-local-mcp-ui.mjs",
     "smoke:checkpoint-restore-ui": "node scripts/smoke-checkpoint-restore-ui.mjs",

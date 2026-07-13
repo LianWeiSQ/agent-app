@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    env, fs,
+    env,
     error::Error,
+    fs,
     io::Write,
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
@@ -13,6 +14,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+const DESKTOP_BRIDGE_CORS_ORIGINS: &str =
+    "tauri://localhost,http://tauri.localhost,http://127.0.0.1:5173,http://localhost:5173";
 
 #[derive(Clone, Debug, Serialize)]
 struct DiagnosticPath {
@@ -298,11 +302,18 @@ impl BridgeProcess {
 
         let url = format!("http://127.0.0.1:{port}");
         let mut command = Command::new(&binary.path);
+        let auth_token_path = desktop_auth_token_path();
+        if let Some(token) = non_empty(options.auth_token) {
+            write_secret_file(&auth_token_path, &token)?;
+        } else {
+            let _ = desktop_auth_token()?;
+        }
         let provider_env = provider_env_config(&workspace, &core_root);
         for (key, value) in &provider_env.values {
             command.env(key, value);
         }
         command.env("OPENAGENT_CORE_ROOT", &core_root);
+        command.env("OPENAGENT_BRIDGE_AUTH_TOKEN_FILE", &auth_token_path);
         command
             .arg("--host")
             .arg("127.0.0.1")
@@ -313,14 +324,11 @@ impl BridgeProcess {
             .arg("--session-root")
             .arg(&session_root)
             .arg("--cors-origin")
-            .arg("*")
+            .arg(DESKTOP_BRIDGE_CORS_ORIGINS)
             .arg("--no-mdns")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(token) = non_empty(options.auth_token) {
-            command.arg("--auth-token").arg(token);
-        }
         let workspace_path = PathBuf::from(&workspace);
         if workspace_path.exists() {
             command.current_dir(workspace_path);
@@ -404,9 +412,9 @@ impl ProviderEnvConfig {
         let base_url = self
             .value("OPENAI_BASE_URL")
             .or_else(|| self.value("ANTHROPIC_BASE_URL"));
-        let profile = self
-            .value("OPENAGENT_PROVIDER_PROFILE")
-            .or_else(|| infer_provider_profile(base_url.as_deref(), self.value("OPENAI_MODEL").as_deref()));
+        let profile = self.value("OPENAGENT_PROVIDER_PROFILE").or_else(|| {
+            infer_provider_profile(base_url.as_deref(), self.value("OPENAI_MODEL").as_deref())
+        });
         ProviderEnvSummary {
             env_file: self
                 .env_file
@@ -470,7 +478,10 @@ fn ensure_provider_defaults(values: &mut Vec<(String, String)>) {
     }
     if env_pair_value(values, "OPENAI_BASE_URL").is_none() {
         if let Some(value) = env_pair_value(values, "ANTHROPIC_BASE_URL") {
-            values.push(("OPENAI_BASE_URL".to_string(), openai_compatible_base_url(&value)));
+            values.push((
+                "OPENAI_BASE_URL".to_string(),
+                openai_compatible_base_url(&value),
+            ));
         }
     }
     let openai_model = env_pair_value(values, "OPENAI_MODEL");
@@ -697,12 +708,21 @@ fn provider_config_payload(options: ProviderConfigOptions) -> ProviderConfigPayl
     let profile = normalize_provider_profile(
         config
             .value("OPENAGENT_PROVIDER_PROFILE")
-            .or_else(|| infer_provider_profile(config.value("OPENAI_BASE_URL").as_deref(), config.value("OPENAI_MODEL").as_deref()))
+            .or_else(|| {
+                infer_provider_profile(
+                    config.value("OPENAI_BASE_URL").as_deref(),
+                    config.value("OPENAI_MODEL").as_deref(),
+                )
+            })
             .as_deref(),
     );
     let base_url = config
         .value("OPENAI_BASE_URL")
-        .or_else(|| config.value("ANTHROPIC_BASE_URL").map(|value| openai_compatible_base_url(&value)))
+        .or_else(|| {
+            config
+                .value("ANTHROPIC_BASE_URL")
+                .map(|value| openai_compatible_base_url(&value))
+        })
         .unwrap_or_else(|| provider_profile_default_base_url(&profile).to_string());
     let model = config
         .value("OPENAGENT_MODEL")
@@ -723,7 +743,13 @@ fn provider_config_payload(options: ProviderConfigOptions) -> ProviderConfigPayl
         wire_api: wire_api.clone(),
         api_key_configured,
         env_file: env_file.display().to_string(),
-        env_preview: provider_env_preview(&profile, &base_url, api_key_configured, &model, &wire_api),
+        env_preview: provider_env_preview(
+            &profile,
+            &base_url,
+            api_key_configured,
+            &model,
+            &wire_api,
+        ),
     }
 }
 
@@ -802,14 +828,19 @@ fn normalize_api_key(value: &str) -> Option<String> {
     {
         key = key[1..key.len() - 1].trim().to_string();
     }
-    if let Some(rest) = key.strip_prefix("Bearer ").or_else(|| key.strip_prefix("bearer ")) {
+    if let Some(rest) = key
+        .strip_prefix("Bearer ")
+        .or_else(|| key.strip_prefix("bearer "))
+    {
         key = rest.trim().to_string();
     }
     key = key.replace(['\r', '\n'], "");
     (!key.trim().is_empty()).then_some(key)
 }
 
-fn write_provider_config(request: ProviderConfigWriteRequest) -> Result<ProviderConfigPayload, String> {
+fn write_provider_config(
+    request: ProviderConfigWriteRequest,
+) -> Result<ProviderConfigPayload, String> {
     let core_root = core_workspace_root_from_option(request.core_root.clone());
     let workspace = non_empty(request.workspace.clone()).unwrap_or_else(default_workspace);
     let profile = normalize_provider_profile(request.profile.as_deref());
@@ -858,7 +889,8 @@ fn render_provider_env_file(
     max_steps: Option<&str>,
 ) -> String {
     let mut lines = vec![
-        "# OpenAgent Desktop provider config. This file is local and should not be committed.".to_string(),
+        "# OpenAgent Desktop provider config. This file is local and should not be committed."
+            .to_string(),
         format!("OPENAGENT_PROVIDER_PROFILE={}", quote_env_value(profile)),
         format!("OPENAI_BASE_URL={}", quote_env_value(base_url)),
     ];
@@ -872,7 +904,10 @@ fn render_provider_env_file(
         "OPENAGENT_PROVIDER_STREAM=1".to_string(),
     ]);
     if let Some(max_steps) = max_steps.filter(|value| !value.trim().is_empty()) {
-        lines.push(format!("OPENAGENT_BRIDGE_MAX_STEPS={}", quote_env_value(max_steps)));
+        lines.push(format!(
+            "OPENAGENT_BRIDGE_MAX_STEPS={}",
+            quote_env_value(max_steps)
+        ));
     }
     lines.join("\n")
 }
@@ -896,7 +931,8 @@ fn validate_provider_config(
         .unwrap_or_else(|| provider_profile_default_model(&profile).to_string());
     let wire_api = normalize_wire_api(&request.wire_api)
         .unwrap_or_else(|| provider_profile_default_wire_api(&profile).to_string());
-    let Some(api_key) = provider_api_key_from_request(request.api_key, &workspace, &core_root) else {
+    let Some(api_key) = provider_api_key_from_request(request.api_key, &workspace, &core_root)
+    else {
         return Ok(ProviderValidationResult {
             ok: false,
             profile,
@@ -948,7 +984,10 @@ fn validate_provider_config(
             }
         }
         Err(error) => {
-            messages.push(format!("/models 失败：{}", sanitize_secret(&error, &api_key)));
+            messages.push(format!(
+                "/models 失败：{}",
+                sanitize_secret(&error, &api_key)
+            ));
         }
     }
 
@@ -979,7 +1018,10 @@ fn validate_provider_config(
             }
         }
         Err(error) => {
-            messages.push(format!("最小响应请求失败：{}", sanitize_secret(&error, &api_key)));
+            messages.push(format!(
+                "最小响应请求失败：{}",
+                sanitize_secret(&error, &api_key)
+            ));
         }
     }
 
@@ -1032,7 +1074,9 @@ fn provider_post_json(
     parse_reqwest_json_response(response)
 }
 
-fn parse_reqwest_json_response(response: reqwest::blocking::Response) -> Result<(u16, Value), String> {
+fn parse_reqwest_json_response(
+    response: reqwest::blocking::Response,
+) -> Result<(u16, Value), String> {
     let status = response.status().as_u16();
     let text = response.text().map_err(|error| error.to_string())?;
     let value = serde_json::from_str::<Value>(&text)
@@ -1849,8 +1893,14 @@ mod tests {
     use std::{
         io::Read,
         net::TcpListener,
+        sync::OnceLock,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn environment_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let millis = SystemTime::now()
@@ -1883,6 +1933,9 @@ mod tests {
 
     #[test]
     fn desktop_auth_token_persists_with_override() {
+        let _environment_guard = environment_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = env::temp_dir().join(format!(
             "openagent-desktop-auth-token-{}",
             std::process::id()
@@ -1987,6 +2040,9 @@ mod tests {
 
     #[test]
     fn managed_bridge_starts_restarts_and_stops_runtime() {
+        let _environment_guard = environment_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = temp_root("openagent-desktop-managed-bridge");
         let workspace_a = root.join("workspace-a");
         let workspace_b = root.join("workspace-b");
@@ -1995,6 +2051,8 @@ mod tests {
         fs::create_dir_all(&workspace_b).expect("workspace b");
         let port = free_port();
         let token = "oa_desktop_test_managed_bridge";
+        let token_path = root.join("bridge-auth-token");
+        env::set_var("OPENAGENT_DESKTOP_AUTH_TOKEN_PATH", &token_path);
         let process = BridgeProcess::default();
 
         let started = process
@@ -2010,6 +2068,36 @@ mod tests {
         assert_eq!(started.port, port);
         assert_eq!(started.workspace, workspace_a.display().to_string());
         assert!(started.pid.is_some());
+        assert_eq!(
+            fs::read_to_string(&token_path)
+                .expect("managed token file")
+                .trim(),
+            token
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&token_path)
+                    .expect("managed token metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            let command_line = Command::new("ps")
+                .args([
+                    "-p",
+                    &started.pid.expect("managed pid").to_string(),
+                    "-o",
+                    "command=",
+                ])
+                .output()
+                .expect("inspect managed process args");
+            let command_line = String::from_utf8_lossy(&command_line.stdout);
+            assert!(!command_line.contains(token));
+            assert!(!command_line.contains("--auth-token"));
+        }
 
         let unauthorized = http_get(port, "/api/health", None).expect("unauthorized health");
         assert!(unauthorized.contains("401 Unauthorized"));
@@ -2046,6 +2134,7 @@ mod tests {
         assert!(final_status.pid.is_none());
         assert!(http_get(port, "/api/health", Some(token)).is_err());
 
+        env::remove_var("OPENAGENT_DESKTOP_AUTH_TOKEN_PATH");
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -332,6 +332,8 @@ async function main() {
   const sessionRoot = path.join(tempRoot, "sessions");
   fs.mkdirSync(workspace, { recursive: true });
   fs.mkdirSync(sessionRoot, { recursive: true });
+  const tokenPath = path.join(tempRoot, "bridge-auth-token");
+  fs.writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
   const localMcp = prepareLocalMcpConfig(workspace, tempRoot);
 
   let runtime;
@@ -360,12 +362,13 @@ async function main() {
         workspace,
         "--session-root",
         sessionRoot,
-        "--auth-token",
-        token,
         "--cors-origin",
-        "*",
+        `http://127.0.0.1:${vitePort}`,
       ],
-      { cwd: repoRoot, env: process.env },
+      {
+        cwd: repoRoot,
+        env: { ...process.env, OPENAGENT_BRIDGE_AUTH_TOKEN_FILE: tokenPath },
+      },
     );
 
     await waitForHttp(`http://127.0.0.1:${runtimePort}/api/health`, {
