@@ -1,0 +1,23 @@
+# Goal State
+
+- original_user_request: 完成所有的 P0 任务。完成就算结束。
+- objective_locked: 完成 Desktop P0 的会话可靠性、Provider 重试恢复、假入口清理、安全收口和 App CI，并通过集中验收。
+- non_goals: Goal mode、Plan mode、富媒体附件、Subagent 产品面板和其他 P1/P2 功能。
+- success_criteria:
+  - 会话创建、切换、删除、项目切换和重启不会串 timeline/Inspector 状态。
+  - Provider 重试、fallback、失败和可恢复状态对用户可见并可操作。
+  - 主界面和 Settings 不保留无行为的假入口。
+  - Bridge token 不出现在进程参数中，CORS 与 CSP 有受限默认值。
+  - App CI 覆盖前端构建、Rust check、敏感信息扫描和关键 P0 smoke。
+- current_slice: P0 complete.
+- slice_boundary: All frozen Desktop P0 acceptance criteria are implemented and verified.
+- allowed_actions: 本地修改和验证；不推送 GitHub，除非 William 明确要求。
+- interrupt_policy: 收到 stop/status/pause 时在当前工具调用结束后交还控制。
+- last_receipts:
+  - 2026-07-11: P0-1 complete; persisted active session per project, rejected stale async session responses with a view epoch, cleared active state before delete, and added a cross-session/project/delete/reload smoke; `npm run build` and `npm run smoke:session-lifecycle` passed.
+  - 2026-07-11: P0-2 complete; persisted `turn/retrying` and `turn/fallback`, retained resumable failed-turn payloads, added `POST /api/turns/{turn_id}/retry`, surfaced retry/fallback/failure state in Desktop, and added a real 502-to-manual-recovery smoke; Rust protocol/retry/fallback/manual-retry tests, frontend build, provider recovery smoke, and session lifecycle smoke passed.
+  - 2026-07-11: P0-3 complete; wired scheduled/plugin/runtime-status entries to Inspector or Settings, removed inert search/more controls and unimplemented work-mode/theme/browser/hook/goal-plan pages, and added UI/static assertions that no enabled button lacks behavior; frontend build, session lifecycle/control smoke, and diff checks passed.
+  - 2026-07-11: P0-4 complete; moved managed and smoke Bridge authentication from CLI secrets to `0600` token files, restricted default/managed CORS to Tauri and exact local origins with REST/preflight/SSE rejection, and enabled a constrained Tauri CSP; runtime security tests, real managed-process argv inspection, Tauri/frontend checks, restricted-origin session/provider smokes, formatting, and diff checks passed.
+  - 2026-07-12: P0-5 complete; added the App-owned `Desktop P0` workflow, one reproducible `npm run ci:p0` gate, secret/static-control/CSP checks, full HTTP runtime and Tauri tests, and strengthened browser smokes for real Bridge restart plus visible automatic retry/fallback/manual recovery. Final gate passed: 21 runtime unit tests, 54 runtime integration tests, 4 Tauri tests, frontend/Rust checks, session isolation smoke, provider recovery smoke, workflow YAML/ref validation, secret scan, formatting, and diff checks.
+- next_recommended_slice: none; frozen P0 objective complete.
+- blockers: []
