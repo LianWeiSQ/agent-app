@@ -3,7 +3,9 @@ import {
   AlertTriangle,
   ArrowUp,
   Bot,
+  Check,
   CheckCircle2,
+  ChevronRight,
   Circle,
   Database,
   FileText,
@@ -71,17 +73,34 @@ function isMissingSessionError(error: unknown): boolean {
   );
 }
 
-function userFacingErrorMessage(error: unknown): string {
+function errorDiagnosticText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const body = error instanceof ApiError ? error.body : undefined;
-  const bodyError = typeof body?.error === "string" ? body.error : "";
-  const text = `${message}\n${bodyError}`.toLowerCase();
+  const bodyError = body?.error;
+  const serializedBodyError =
+    typeof bodyError === "string"
+      ? bodyError
+      : bodyError && typeof bodyError === "object"
+        ? JSON.stringify(bodyError)
+        : "";
+  return `${message}\n${serializedBodyError}`;
+}
+
+function userFacingErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const text = errorDiagnosticText(error).toLowerCase();
+  const providerStatus = text.match(/provider returned http\s+(\d{3})/)?.[1];
   if (isMissingSessionError(error)) return "会话状态丢失或已过期，请重新打开该会话，或新建一个会话继续。";
-  if (text.includes("provider returned http 502") || text.includes("upstream service temporarily unavailable")) {
-    return "模型服务暂时不可用，上游返回 502。请稍后重试，或在 Settings → 配置里切换模型/Provider。";
-  }
-  if (text.includes("provider returned http 429") || text.includes("rate limit")) {
+  if (providerStatus === "429" || text.includes("rate limit")) {
     return "模型服务限流了，请稍后重试。";
+  }
+  if (
+    (providerStatus && Number(providerStatus) >= 500 && Number(providerStatus) <= 599) ||
+    text.includes("upstream service temporarily unavailable") ||
+    text.includes("service temporarily unavailable")
+  ) {
+    const statusLabel = providerStatus ? `（HTTP ${providerStatus}）` : "";
+    return `模型服务暂时不可用${statusLabel}。请稍后重试，或在 Settings → 配置里验证连接、切换模型/Provider。`;
   }
   if (text.includes("401") || text.includes("unauthorized")) {
     return "Bridge 未授权，请在 Settings → 连接里检查本地 token。";
@@ -257,6 +276,108 @@ type SessionDiff = {
   latest?: JsonRecord | null;
   patches?: JsonRecord[];
   redo?: JsonRecord[];
+};
+
+type ContextTraceSummary = {
+  kind?: string;
+  source?: string;
+  priority?: number;
+  pinned?: boolean;
+  stable_prefix?: boolean;
+  token_estimate?: number;
+  included?: boolean;
+  drop_reason?: string | null;
+  delivery?: string;
+  truncated?: boolean;
+  original_token_estimate?: number | null;
+  truncation_reason?: string | null;
+  truncation_strategy?: string | null;
+  semantic_duplicate?: boolean;
+};
+
+type ContextReceipt = {
+  pack_hash?: string;
+  provider_input_hash?: string;
+  message_count?: number;
+  message_role_counts?: Record<string, number>;
+  tool_manifest_count?: number;
+  tool_names?: string[];
+  model_option_keys?: string[];
+  item_count?: number;
+  included_item_count?: number;
+  dropped_item_count?: number;
+  item_kind_counts?: Record<string, number>;
+  item_delivery_counts?: Record<string, number>;
+  drop_reason_counts?: Record<string, number>;
+  truncated_item_count?: number;
+  truncation_reason_counts?: Record<string, number>;
+  truncation_strategy_counts?: Record<string, number>;
+  semantic_duplicate_count?: number;
+  stable_prefix?: JsonRecord;
+  estimated_input_tokens?: number;
+  budget?: JsonRecord;
+};
+
+type ContextFailureSummary = {
+  code?: string;
+  stage?: string;
+  message?: string;
+  retryable?: boolean;
+  recoverable?: boolean;
+  details?: JsonRecord;
+};
+
+type ContextPerformanceSummary = {
+  status?: "ok" | "warning";
+  materialize_us?: number;
+  build_us?: number;
+  persist_us?: number;
+  provider_payload_build_us?: number;
+  provider_payload_serialize_us?: number;
+  provider_payload_bytes?: number;
+  source_message_count?: number;
+  tool_count?: number;
+  item_count?: number;
+  warning_codes?: string[];
+};
+
+type ContextDiagnosticsEnvelope = {
+  run_id?: string | null;
+  step?: number | null;
+  receipt?: ContextReceipt;
+  trace?: ContextTraceSummary[];
+  prefix_cache?: JsonRecord;
+  rebuilt?: boolean;
+  rebuild_reason?: string | null;
+  performance?: ContextPerformanceSummary | null;
+  failure?: ContextFailureSummary | null;
+};
+
+type ContextDiagnosticsPayload = {
+  schema_version?: string;
+  session_id?: string;
+  status?: "ready" | "degraded" | "corrupt" | "unavailable";
+  latest?: ContextDiagnosticsEnvelope | null;
+  history?: ContextDiagnosticsEnvelope[];
+  history_count?: number;
+  returned_count?: number;
+  corrupt_count?: number;
+  failure?: ContextFailureSummary | null;
+  last_replay?: ContextReplaySummary | null;
+  redaction?: JsonRecord;
+};
+
+type ContextReplaySummary = {
+  replay_id?: string | null;
+  session_id?: string | null;
+  status?: "verified" | "drifted" | "rebuilt" | "unrecoverable";
+  reasons?: string[];
+  failure?: ContextFailureSummary | null;
+  side_effects?: JsonRecord;
+};
+
+type ContextReplayResult = ContextReplaySummary & {
+  diagnostics?: ContextDiagnosticsPayload;
 };
 
 type CheckpointSummary = {
@@ -604,6 +725,8 @@ type SettingsPage =
   | "worktree"
   | "archived";
 
+type ModelSettingPicker = "model" | "reasoning" | "speed" | null;
+
 type SseEventHandler = (events: AppEvent[]) => void | Promise<void>;
 
 const DEFAULT_BRIDGE = import.meta.env.VITE_OPENAGENT_BRIDGE_URL ?? "http://127.0.0.1:8787";
@@ -614,14 +737,29 @@ const STORAGE_PROJECTS = "openagent.desktop.projects";
 const STORAGE_ACTIVE_PROJECT = "openagent.desktop.activeProject";
 const STORAGE_ACTIVE_SESSIONS = "openagent.desktop.activeSessions";
 const STORAGE_PERMISSION_MODE = "openagent.desktop.permissionMode";
+const STORAGE_COMPOSER_MODEL = "openagent.desktop.composerModel";
+const STORAGE_REASONING_EFFORT = "openagent.desktop.reasoningEffort";
+const STORAGE_RESPONSE_SPEED = "openagent.desktop.responseSpeed";
+
+const REASONING_EFFORT_OPTIONS = [
+  { value: "low", label: "轻度" },
+  { value: "medium", label: "中" },
+  { value: "high", label: "高" },
+  { value: "xhigh", label: "极高" },
+] as const;
+
+const RESPONSE_SPEED_OPTIONS = [
+  { value: "standard", label: "标准", description: "默认速度" },
+  { value: "fast", label: "快速", description: "优先服务通道，用量可能更多" },
+] as const;
 
 const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; model: string; wireApi: string; models: string[] }> = {
   gpt: {
     label: "GPT / OpenAI compatible",
     baseUrl: "https://api.openai.com/v1",
-    model: "gpt-5.5",
+    model: "gpt-5.6-sol",
     wireApi: "responses",
-    models: ["gpt-5.4", "gpt-5.5", "gpt-image-1.5", "gpt-image-2"],
+    models: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"],
   },
   glm: {
     label: "GLM / OpenAI compatible",
@@ -631,6 +769,42 @@ const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; model: 
     models: ["glm-4.5", "glm-4.5-air", "glm-4-flash", "glm-4-plus"],
   },
 };
+
+function isSelectableTextModel(model: string) {
+  const normalized = model.trim().toLowerCase();
+  return Boolean(normalized) && normalized !== "gpt-5.6" && !normalized.includes("mini") && !normalized.startsWith("gpt-image");
+}
+
+function sortModelsWithSolFirst(models: string[]): string[] {
+  return models
+    .map((model, index) => ({ model, index }))
+    .sort((left, right) => {
+      const leftIsSol = left.model.trim().toLowerCase().includes("sol");
+      const rightIsSol = right.model.trim().toLowerCase().includes("sol");
+      if (leftIsSol !== rightIsSol) return leftIsSol ? -1 : 1;
+      return left.index - right.index;
+    })
+    .map(({ model }) => model);
+}
+
+function modelDisplayName(model: string): string {
+  const normalized = model.trim();
+  if (!normalized) return "未选择";
+  const gptMatch = normalized.match(/^gpt-(\d+(?:\.\d+)*)(?:-(.+))?$/i);
+  if (gptMatch) {
+    const variant = gptMatch[2]
+      ? gptMatch[2]
+          .split("-")
+          .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+          .join(" ")
+      : "";
+    return `${gptMatch[1]}${variant ? ` ${variant}` : ""}`;
+  }
+  return normalized
+    .split("-")
+    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
 
 function providerPreset(profile?: string | null) {
   return PROVIDER_PRESETS[profile === "glm" ? "glm" : "gpt"];
@@ -650,11 +824,12 @@ function defaultProviderDraft(): ProviderDraft {
 function providerDraftFromPayload(payload?: ProviderConfigPayload | null): ProviderDraft {
   const profile = payload?.profile === "glm" ? "glm" : "gpt";
   const preset = providerPreset(profile);
+  const payloadModel = payload?.model || "";
   return {
     profile,
     baseUrl: payload?.base_url || preset.baseUrl,
     apiKey: "",
-    model: payload?.model || preset.model,
+    model: isSelectableTextModel(payloadModel) ? payloadModel : preset.model,
     wireApi: payload?.wire_api || preset.wireApi,
   };
 }
@@ -1166,6 +1341,93 @@ function formatBytes(value?: number): string {
   if (value < 1024) return `${value} B`;
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatContextTokens(value?: number): string {
+  const tokens = value ?? 0;
+  if (tokens < 1000) return `${tokens}`;
+  if (tokens < 10_000) return `${(tokens / 1000).toFixed(1)}k`;
+  return `${Math.round(tokens / 1000)}k`;
+}
+
+function formatContextDuration(value?: number): string {
+  const microseconds = value ?? 0;
+  if (microseconds < 1_000) return `${microseconds} µs`;
+  if (microseconds < 1_000_000) return `${(microseconds / 1_000).toFixed(1)} ms`;
+  return `${(microseconds / 1_000_000).toFixed(2)} s`;
+}
+
+function contextFailureLabel(code?: string): string {
+  const labels: Record<string, string> = {
+    context_unavailable: "上下文尚未构建",
+    context_receipt_corrupt: "上下文诊断损坏",
+    context_budget_exceeded: "上下文超过模型预算",
+    context_source_drift: "上下文来源已变化",
+    context_replay_unsupported: "当前记录无法安全重建",
+  };
+  return labels[code ?? ""] || code || "上下文异常";
+}
+
+function contextPerformanceWarningLabel(code: string): string {
+  const labels: Record<string, string> = {
+    context_build_slow: "装配偏慢",
+    provider_payload_serialize_slow: "请求序列化偏慢",
+    provider_payload_large: "请求体偏大",
+  };
+  return labels[code] || code;
+}
+
+function contextKindLabel(kind?: string): string {
+  const labels: Record<string, string> = {
+    instruction: "项目指令",
+    message: "会话消息",
+    tool_result: "工具结果",
+    attachment_file: "附件",
+    attachment_image: "图片",
+    skill_preloaded: "已加载 Skill",
+    skill_available: "Skill 目录",
+    mcp_tool_manifest: "MCP 工具",
+    todo: "Todo",
+    checkpoint: "Checkpoint",
+    work_state: "工作状态",
+    sandbox: "执行环境",
+  };
+  return labels[kind ?? ""] || kind || "上下文";
+}
+
+function contextDecisionLabel(entry: ContextTraceSummary): string {
+  if (entry.truncated) return `已截断${entry.truncation_strategy ? ` · ${entry.truncation_strategy}` : ""}`;
+  if (!entry.included) return entry.drop_reason ? `已丢弃 · ${entry.drop_reason}` : "已丢弃";
+  if (entry.delivery === "trace_only") return "已嵌入";
+  if (entry.delivery === "tool_manifest") return "工具定义";
+  return "已纳入";
+}
+
+function contextReplayLabel(status?: ContextReplaySummary["status"]): string {
+  if (status === "verified") return "已验证";
+  if (status === "drifted") return "来源已变化";
+  if (status === "rebuilt") return "已安全重建";
+  if (status === "unrecoverable") return "无法精确重建";
+  return "";
+}
+
+function contextReplayReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    context_budget_changed: "预算参数变化",
+    context_budget_selection_changed: "预算筛选结果变化",
+    context_pack_changed: "上下文内容变化",
+    context_sources_changed: "上下文来源变化",
+    latest_receipt_corrupt_or_legacy: "原诊断损坏或版本过旧",
+    latest_receipt_missing: "原诊断缺失",
+    message_projection_changed: "会话投影变化",
+    model_options_changed: "模型参数变化",
+    provider_input_changed: "Provider 输入变化",
+    stable_prefix_changed: "稳定前缀变化",
+    target_receipt_not_found: "找不到目标构建记录",
+    tool_catalog_changed: "工具目录变化",
+  };
+  if (reason.startsWith("unsupported_model_options:")) return "包含不可安全持久化的模型参数";
+  return labels[reason] || reason;
 }
 
 function attachmentName(path: string, fallback = "attachment"): string {
@@ -2802,6 +3064,7 @@ function sessionEventChanged(method: string): boolean {
     method.includes("toolCall") ||
     method.includes("question") ||
     method.includes("approval") ||
+    method.startsWith("context/") ||
     method.includes("checkpoint") ||
     method.includes("patch")
   );
@@ -2879,6 +3142,9 @@ export function App() {
   const [restoringCheckpointId, setRestoringCheckpointId] = useState("");
   const [restoredCheckpointId, setRestoredCheckpointId] = useState("");
   const [sessionDiff, setSessionDiff] = useState<SessionDiff | null>(null);
+  const [contextDiagnostics, setContextDiagnostics] = useState<ContextDiagnosticsPayload | null>(null);
+  const [contextReplayBusy, setContextReplayBusy] = useState(false);
+  const [contextReplayError, setContextReplayError] = useState("");
   const [checkpoints, setCheckpoints] = useState<CheckpointsPayload | null>(null);
   const [fileTree, setFileTree] = useState<FilesPayload | null>(null);
   const [filePreview, setFilePreview] = useState<FilesPayload | null>(null);
@@ -2896,7 +3162,14 @@ export function App() {
   const [attachmentError, setAttachmentError] = useState("");
   const [composerDockHeight, setComposerDockHeight] = useState(164);
   const [permission, setPermission] = useState(() => normalizePermissionMode(storedValue(STORAGE_PERMISSION_MODE, "REQUEST_APPROVAL")));
-  const [model, setModel] = useState("");
+  const [model, setModel] = useState(() => {
+    const storedModel = storedValue(STORAGE_COMPOSER_MODEL, "");
+    return isSelectableTextModel(storedModel) ? storedModel : "";
+  });
+  const [reasoningEffort, setReasoningEffort] = useState(() => storedValue(STORAGE_REASONING_EFFORT, "xhigh"));
+  const [responseSpeed, setResponseSpeed] = useState(() => storedValue(STORAGE_RESPONSE_SPEED, "standard"));
+  const [composerModelMenuOpen, setComposerModelMenuOpen] = useState(false);
+  const [composerModelPicker, setComposerModelPicker] = useState<ModelSettingPicker>(null);
   const [providerConfig, setProviderConfig] = useState<ProviderConfigPayload | null>(null);
   const [providerDraft, setProviderDraft] = useState<ProviderDraft>(() => defaultProviderDraft());
   const [providerBusy, setProviderBusy] = useState("");
@@ -2935,6 +3208,7 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsPage, setSettingsPage] = useState<SettingsPage>("general");
   const [settingsSearch, setSettingsSearch] = useState("");
+  const [modelSettingPicker, setModelSettingPicker] = useState<ModelSettingPicker>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [, setInspectorMode] = useState<"overview" | "review">("overview");
   const [error, setError] = useState("");
@@ -2991,7 +3265,7 @@ export function App() {
       });
       setProviderConfig(payload);
       setProviderDraft(providerDraftFromPayload(payload));
-      setModel((current) => current || payload.model || "");
+      setModel((current) => (isSelectableTextModel(current) ? current : providerDraftFromPayload(payload).model));
       setProviderConfigError("");
       setProviderValidation(null);
     } catch (err) {
@@ -3344,6 +3618,9 @@ export function App() {
     setSelectedTurnJobId("");
     setSessionMessages(null);
     setSessionDiff(null);
+    setContextDiagnostics(null);
+    setContextReplayBusy(false);
+    setContextReplayError("");
     setCheckpoints(null);
     setRestoredCheckpointId("");
     setEvents([]);
@@ -3438,17 +3715,20 @@ export function App() {
       if (!session) {
         if (activeSessionIdRef.current !== "" || sessionViewEpochRef.current !== expectedEpoch) return;
         setSessionDiff(null);
+        setContextDiagnostics(null);
         setCheckpoints(null);
         await refreshWorkspaceContext("", expectedEpoch);
         return;
       }
       try {
-        const [diffPayload, checkpointsPayload] = await Promise.all([
+        const [diffPayload, contextPayload, checkpointsPayload] = await Promise.all([
           api<SessionDiff>(`/api/sessions/${session}/diff`),
+          api<ContextDiagnosticsPayload>(`/api/sessions/${session}/context?limit=12`),
           api<CheckpointsPayload>(`/api/sessions/${session}/checkpoints`),
         ]);
         if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         setSessionDiff(diffPayload);
+        setContextDiagnostics({ ...contextPayload, session_id: contextPayload.session_id || session });
         setCheckpoints(checkpointsPayload);
         await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"), expectedEpoch);
       } catch (err) {
@@ -3463,6 +3743,37 @@ export function App() {
     },
     [api, clearMissingSession, refreshWorkspaceContext],
   );
+
+  const replaySessionContext = useCallback(async () => {
+    const session = activeSessionIdRef.current;
+    if (!session || contextReplayBusy) return;
+    const expectedEpoch = sessionViewEpochRef.current;
+    setContextReplayBusy(true);
+    setContextReplayError("");
+    try {
+      const payload = await api<ContextReplayResult>(`/api/sessions/${session}/context/replay`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+      if (payload.diagnostics) {
+        setContextDiagnostics({
+          ...payload.diagnostics,
+          session_id: payload.diagnostics.session_id || session,
+          last_replay: payload.diagnostics.last_replay ?? payload,
+        });
+      } else {
+        await refreshSessionTrust(session, expectedEpoch);
+      }
+    } catch (err) {
+      if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+      setContextReplayError(userFacingErrorMessage(err));
+    } finally {
+      if (activeSessionIdRef.current === session && sessionViewEpochRef.current === expectedEpoch) {
+        setContextReplayBusy(false);
+      }
+    }
+  }, [api, contextReplayBusy, refreshSessionTrust]);
 
   const refresh = useCallback(async () => {
     const expectedEpoch = sessionViewEpochRef.current;
@@ -4031,6 +4342,14 @@ export function App() {
             body: JSON.stringify({
               input: text,
               model: model || undefined,
+              ...(model.toLowerCase().startsWith("gpt-") && providerDraft.wireApi === "responses"
+                ? {
+                    model_options: {
+                      reasoning: { effort: reasoningEffort },
+                      ...(responseSpeed === "fast" ? { service_tier: "priority" } : {}),
+                    },
+                  }
+                : {}),
               attachments: composerAttachments.map(attachmentPayload),
               ...permissionPayloadForMode(permission),
               stream: true,
@@ -4060,6 +4379,8 @@ export function App() {
           setComposerAttachments([]);
           setAttachmentMenuOpen(false);
           setAttachmentError("");
+          setComposerModelMenuOpen(false);
+          setComposerModelPicker(null);
           if (hasStreamedDeltas) {
             await nextPaint();
             await sleepMs(320);
@@ -4110,6 +4431,9 @@ export function App() {
       model,
       permission,
       prompt,
+      providerDraft.wireApi,
+      reasoningEffort,
+      responseSpeed,
       refresh,
       refreshSessionMessages,
       refreshSessionTrust,
@@ -4195,6 +4519,29 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem(STORAGE_PERMISSION_MODE, normalizePermissionMode(permission));
   }, [permission]);
+
+  useEffect(() => {
+    if (model) window.localStorage.setItem(STORAGE_COMPOSER_MODEL, model);
+  }, [model]);
+
+  useEffect(() => {
+    window.localStorage.setItem(STORAGE_REASONING_EFFORT, reasoningEffort);
+  }, [reasoningEffort]);
+
+  useEffect(() => {
+    window.localStorage.setItem(STORAGE_RESPONSE_SPEED, responseSpeed);
+  }, [responseSpeed]);
+
+  useEffect(() => {
+    if (!composerModelMenuOpen) return;
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setComposerModelMenuOpen(false);
+      setComposerModelPicker(null);
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [composerModelMenuOpen]);
 
   useEffect(() => {
     if (!bridgeApiReady) return;
@@ -4418,16 +4765,31 @@ export function App() {
   const modelOptions = useMemo(
     () =>
       (provider?.models?.map((item) => item.id).filter(Boolean) as string[] | undefined)?.filter(
-        (item) => !item.toLowerCase().includes("mini"),
+        isSelectableTextModel,
       ),
     [provider?.models],
   );
   const providerDraftModelOptions = useMemo(() => {
     const preset = providerPreset(providerDraft.profile);
     return Array.from(
-      new Set([providerDraft.model, model, ...preset.models, ...(modelOptions ?? [])].filter(Boolean)),
+      new Set([providerDraft.model, model, ...preset.models, ...(modelOptions ?? [])].filter(isSelectableTextModel)),
     );
   }, [model, modelOptions, providerDraft.model, providerDraft.profile]);
+  const prioritizedModelOptions = useMemo(
+    () => sortModelsWithSolFirst(modelOptions?.length ? modelOptions : providerDraftModelOptions),
+    [modelOptions, providerDraftModelOptions],
+  );
+  const reasoningEffortLabel = REASONING_EFFORT_OPTIONS.find((item) => item.value === reasoningEffort)?.label ?? "极高";
+  const responseSpeedOption = RESPONSE_SPEED_OPTIONS.find((item) => item.value === responseSpeed) ?? RESPONSE_SPEED_OPTIONS[0];
+  const defaultComposerModel = isSelectableTextModel(providerConfig?.model || "")
+    ? providerConfig?.model || providerDraft.model
+    : providerPreset(providerDraft.profile).model;
+  const resetComposerModelSettings = () => {
+    setModel(defaultComposerModel);
+    setReasoningEffort("xhigh");
+    setResponseSpeed("standard");
+    setComposerModelPicker(null);
+  };
   const mcpServers = mcp?.servers ?? [];
   const mcpToolTraces = useMemo(() => mcpToolTracesFromMessages(activeMessages), [activeMessages]);
   const latestMcpToolTrace = mcpToolTraces[mcpToolTraces.length - 1];
@@ -4603,6 +4965,21 @@ export function App() {
   const leaseStaleLabel = schedulerDuration(scheduler.turn_queue_lease_stale_ms);
   const activeProjectLabel = activeProject?.name || projectNameFromPath(selectedProjectPath || "Workspace");
   const activeProjectDisplayPath = selectedProjectPath || "No project selected";
+  const activeContextDiagnostics =
+    activeSessionId && contextDiagnostics?.session_id === activeSessionId ? contextDiagnostics : null;
+  const contextLatest = activeContextDiagnostics?.latest ?? null;
+  const contextReplay = activeContextDiagnostics?.last_replay ?? null;
+  const contextReceipt = contextLatest?.receipt;
+  const contextTrace = contextLatest?.trace ?? [];
+  const contextPerformance = contextLatest?.performance ?? null;
+  const contextFailure = contextLatest?.failure ?? activeContextDiagnostics?.failure ?? null;
+  const contextBudget = contextReceipt?.budget ?? {};
+  const contextInputLimit = numberField(contextBudget, "input_limit_tokens");
+  const contextEstimatedTokens = contextReceipt?.estimated_input_tokens ?? 0;
+  const contextBudgetPercent = contextInputLimit
+    ? Math.min(100, Math.round((contextEstimatedTokens / contextInputLimit) * 100))
+    : 0;
+  const contextPrefixStatus = stringField(contextLatest?.prefix_cache, "status") || "unknown";
   const pendingInteractionCount = approvals.length + questions.length;
   const trustSyncLabel = interactionSync.last_synced_at_ms
     ? `${new Date(interactionSync.last_synced_at_ms).toLocaleTimeString()}${
@@ -5278,19 +5655,32 @@ export function App() {
                 <h2>常规</h2>
                 <p>设置当前会话使用的模型和默认权限策略。</p>
               </div>
-              <label className="settings-row-control">
-                <span>
-                  <strong>默认模型</strong>
-                  <small>{provider?.healthy ? "Provider ready" : "Provider needs attention"}</small>
-                </span>
-                <select value={model} onChange={(event) => setModel(event.target.value)}>
-                  {(modelOptions?.length ? modelOptions : providerDraftModelOptions).map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <div className="model-settings-list" aria-label="模型设置">
+                <button className="model-settings-row" onClick={() => setModelSettingPicker("model")} type="button">
+                  <strong>模型</strong>
+                  <span>
+                    {modelDisplayName(model)}
+                    <ChevronRight aria-hidden="true" size={21} />
+                  </span>
+                </button>
+                <button className="model-settings-row" onClick={() => setModelSettingPicker("reasoning")} type="button">
+                  <strong>推理强度</strong>
+                  <span>
+                    {reasoningEffortLabel}
+                    <ChevronRight aria-hidden="true" size={21} />
+                  </span>
+                </button>
+                <button className="model-settings-row" onClick={() => setModelSettingPicker("speed")} type="button">
+                  <strong>速度</strong>
+                  <span>
+                    {responseSpeedOption.label}
+                    <ChevronRight aria-hidden="true" size={21} />
+                  </span>
+                </button>
+              </div>
+              <p className="model-settings-hint">
+                {provider?.healthy ? "推理强度会随 GPT Responses 请求发送。" : "连接 Provider 后可使用所选模型。"}
+              </p>
             </section>
 
             <section className="settings-section">
@@ -5399,7 +5789,7 @@ export function App() {
                     placeholder={providerPreset(providerDraft.profile).model}
                   />
                   <datalist id="provider-model-options">
-                    {providerDraftModelOptions.map((item) => (
+                    {prioritizedModelOptions.map((item) => (
                       <option key={item} value={item} />
                     ))}
                   </datalist>
@@ -6210,6 +6600,67 @@ export function App() {
           </header>
           {settingsPageContent}
         </section>
+        {modelSettingPicker ? (
+          <div className="model-settings-picker-backdrop" onMouseDown={() => setModelSettingPicker(null)} role="presentation">
+            <section
+              aria-label={modelSettingPicker === "model" ? "模型" : modelSettingPicker === "reasoning" ? "推理强度" : "速度"}
+              className="model-settings-picker"
+              onMouseDown={(event) => event.stopPropagation()}
+              role="dialog"
+            >
+              <h2>{modelSettingPicker === "model" ? "模型" : modelSettingPicker === "reasoning" ? "推理强度" : "速度"}</h2>
+              <div className="model-settings-picker-options">
+                {modelSettingPicker === "model"
+                  ? prioritizedModelOptions.map((item) => (
+                      <button
+                        className={model === item ? "selected" : ""}
+                        key={item}
+                        onClick={() => {
+                          setModel(item);
+                          setModelSettingPicker(null);
+                        }}
+                        type="button"
+                      >
+                        <span>{modelDisplayName(item)}</span>
+                        {model === item ? <Check aria-label="已选择" size={24} /> : null}
+                      </button>
+                    ))
+                  : modelSettingPicker === "reasoning"
+                    ? REASONING_EFFORT_OPTIONS.map((item) => (
+                        <button
+                          className={reasoningEffort === item.value ? "selected" : ""}
+                          key={item.value}
+                          onClick={() => {
+                            setReasoningEffort(item.value);
+                            setModelSettingPicker(null);
+                          }}
+                          type="button"
+                        >
+                          <span>{item.label}</span>
+                          {reasoningEffort === item.value ? <Check aria-label="已选择" size={24} /> : null}
+                        </button>
+                      ))
+                    : RESPONSE_SPEED_OPTIONS.map((item) => (
+                        <button
+                          className={responseSpeed === item.value ? "selected" : ""}
+                          key={item.value}
+                          onClick={() => {
+                            setResponseSpeed(item.value);
+                            setModelSettingPicker(null);
+                          }}
+                          type="button"
+                        >
+                          <span>
+                            <strong>{item.label}</strong>
+                            <small>{item.description}</small>
+                          </span>
+                          {responseSpeed === item.value ? <Check aria-label="已选择" size={24} /> : null}
+                        </button>
+                      ))}
+              </div>
+            </section>
+          </div>
+        ) : null}
       </main>
     );
   }
@@ -6733,6 +7184,17 @@ export function App() {
                 >
                   <Plus size={18} />
                 </button>
+                <select
+                  className="composer-permission-select"
+                  value={permission}
+                  onChange={(event) => setPermission(normalizePermissionMode(event.target.value))}
+                  title="Permission"
+                >
+                  <option value="REQUEST_APPROVAL">请求批准</option>
+                  <option value="AUTO_APPROVE">替我审批</option>
+                  <option value="FULL_ACCESS">完全访问</option>
+                  <option value="READONLY">只读</option>
+                </select>
                 {attachmentMenuOpen ? (
                   <div className="composer-attach-menu" role="menu">
                     <button onClick={() => chooseComposerAttachments("choose_attachment_files")} role="menuitem" type="button">
@@ -6751,23 +7213,143 @@ export function App() {
                 ) : null}
               </div>
               <div className="composer-controls">
-                <select
-                  value={permission}
-                  onChange={(event) => setPermission(normalizePermissionMode(event.target.value))}
-                  title="Permission"
-                >
-                  <option value="REQUEST_APPROVAL">请求批准</option>
-                  <option value="AUTO_APPROVE">替我审批</option>
-                  <option value="FULL_ACCESS">完全访问</option>
-                  <option value="READONLY">只读</option>
-                </select>
-                <select value={model} onChange={(event) => setModel(event.target.value)} title="Model">
-                  {(modelOptions?.length ? modelOptions : providerDraftModelOptions).map((item) => (
-                    <option key={item} value={item}>
-                      {item}
-                    </option>
-                  ))}
-                </select>
+                <div className="composer-model-control">
+                  <button
+                    aria-expanded={composerModelMenuOpen}
+                    aria-haspopup="menu"
+                    className="composer-model-trigger"
+                    onClick={() => {
+                      setComposerModelMenuOpen((current) => !current);
+                      setComposerModelPicker(null);
+                    }}
+                    title="模型设置"
+                    type="button"
+                  >
+                    <span>{modelDisplayName(model)}</span>
+                    <small>{reasoningEffortLabel}</small>
+                    <ChevronRight aria-hidden="true" size={15} />
+                  </button>
+                  {composerModelMenuOpen ? (
+                    <>
+                      <div
+                        className="composer-model-menu-backdrop"
+                        onPointerDown={() => {
+                          setComposerModelMenuOpen(false);
+                          setComposerModelPicker(null);
+                        }}
+                        role="presentation"
+                      />
+                      <div className="composer-model-popovers">
+                        <section aria-label="模型设置" className="composer-model-menu" role="menu">
+                          <button
+                            className={composerModelPicker === "model" ? "selected" : ""}
+                            onClick={() => setComposerModelPicker("model")}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <strong>模型</strong>
+                            <span>
+                              {modelDisplayName(model)}
+                              <ChevronRight aria-hidden="true" size={15} />
+                            </span>
+                          </button>
+                          <button
+                            className={composerModelPicker === "reasoning" ? "selected" : ""}
+                            onClick={() => setComposerModelPicker("reasoning")}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <strong>推理强度</strong>
+                            <span>
+                              {reasoningEffortLabel}
+                              <ChevronRight aria-hidden="true" size={15} />
+                            </span>
+                          </button>
+                          <button
+                            className={composerModelPicker === "speed" ? "selected" : ""}
+                            onClick={() => setComposerModelPicker("speed")}
+                            role="menuitem"
+                            type="button"
+                          >
+                            <strong>速度</strong>
+                            <span>
+                              {responseSpeedOption.label}
+                              <ChevronRight aria-hidden="true" size={15} />
+                            </span>
+                          </button>
+                          <button className="composer-model-reset" onClick={resetComposerModelSettings} role="menuitem" type="button">
+                            <strong>重置为默认设置</strong>
+                            <RotateCcw aria-hidden="true" size={15} />
+                          </button>
+                        </section>
+                        {composerModelPicker ? (
+                          <section className="composer-model-submenu" role="menu">
+                            <h3>
+                              {composerModelPicker === "model"
+                                ? "模型"
+                                : composerModelPicker === "reasoning"
+                                  ? "推理强度"
+                                  : "速度"}
+                            </h3>
+                            {composerModelPicker === "model"
+                              ? prioritizedModelOptions.map((item) => (
+                                  <button
+                                    className={model === item ? "selected" : ""}
+                                    key={item}
+                                    onClick={() => {
+                                      setModel(item);
+                                      setComposerModelMenuOpen(false);
+                                      setComposerModelPicker(null);
+                                    }}
+                                    role="menuitemradio"
+                                    type="button"
+                                  >
+                                    <span>{modelDisplayName(item)}</span>
+                                    {model === item ? <Check aria-label="已选择" size={16} /> : null}
+                                  </button>
+                                ))
+                              : composerModelPicker === "reasoning"
+                                ? REASONING_EFFORT_OPTIONS.map((item) => (
+                                    <button
+                                      className={reasoningEffort === item.value ? "selected" : ""}
+                                      key={item.value}
+                                      onClick={() => {
+                                        setReasoningEffort(item.value);
+                                        setComposerModelMenuOpen(false);
+                                        setComposerModelPicker(null);
+                                      }}
+                                      role="menuitemradio"
+                                      type="button"
+                                    >
+                                      <span>{item.label}</span>
+                                      {reasoningEffort === item.value ? <Check aria-label="已选择" size={16} /> : null}
+                                    </button>
+                                  ))
+                                : RESPONSE_SPEED_OPTIONS.map((item) => (
+                                    <button
+                                      className={responseSpeed === item.value ? "selected" : ""}
+                                      key={item.value}
+                                      onClick={() => {
+                                        setResponseSpeed(item.value);
+                                        setComposerModelMenuOpen(false);
+                                        setComposerModelPicker(null);
+                                      }}
+                                      role="menuitemradio"
+                                      type="button"
+                                    >
+                                      <span>
+                                        <strong>{item.label}</strong>
+                                        <small>{item.description}</small>
+                                      </span>
+                                      {responseSpeed === item.value ? <Check aria-label="已选择" size={16} /> : null}
+                                    </button>
+                                  ))}
+                          </section>
+                        ) : null}
+                      </div>
+                    </>
+                  ) : null}
+                </div>
               </div>
               <button
                 aria-label={isTurnInterruptible ? "Interrupt active turn" : "Run prompt"}
@@ -6992,6 +7574,157 @@ export function App() {
             </div>
           ) : null}
           {turnJobs.error ? <p className="stream-error">{turnJobs.error}</p> : null}
+        </div>
+        <div className="inspector-card context-inspector-card" data-testid="context-inspector-card">
+          <div className="inspector-title">
+            <Database size={15} />
+            上下文
+            <span className={`trust-count ${activeContextDiagnostics?.status === "ready" ? "clear" : activeContextDiagnostics?.status === "degraded" ? "pending" : "bad"}`}>
+              {activeContextDiagnostics?.status === "ready"
+                ? "已装配"
+                : activeContextDiagnostics?.status === "degraded"
+                  ? "部分恢复"
+                  : activeContextDiagnostics?.status === "corrupt"
+                    ? "诊断损坏"
+                    : "尚未构建"}
+            </span>
+            <button
+              className="context-replay-button"
+              data-testid="context-replay-button"
+              disabled={!activeSessionId || contextReplayBusy}
+              onClick={() => void replaySessionContext()}
+              title="只验证并重建 Context Pack，不调用模型或工具"
+              type="button"
+            >
+              <RefreshCw className={contextReplayBusy ? "spin" : ""} size={12} />
+              {contextReplayBusy ? "验证中" : "验证重建"}
+            </button>
+          </div>
+          {contextReplay ? (
+            <div className={`context-replay-result ${contextReplay.status ?? ""}`} data-testid="context-replay-result">
+              <strong>{contextReplayLabel(contextReplay.status)}</strong>
+              <span>
+                {contextReplay.reasons?.length
+                  ? contextReplay.reasons.map(contextReplayReasonLabel).join(" · ")
+                  : "当前来源可复现同一份 Context Pack"}
+              </span>
+            </div>
+          ) : null}
+          {contextReplayError ? <p className="stream-error">{contextReplayError}</p> : null}
+          {contextFailure ? (
+            <div className="context-failure-summary" data-testid="context-failure-summary">
+              <strong>{contextFailureLabel(contextFailure.code)}</strong>
+              <span>{contextFailure.message || "Context Pack 未能完成当前阶段。"}</span>
+              <small>
+                {contextFailure.retryable ? "可重试" : "不可直接重试"}
+                {contextFailure.recoverable ? " · 可恢复" : " · 无法自动恢复"}
+              </small>
+            </div>
+          ) : null}
+          {contextReceipt ? (
+            <>
+              <div className="context-metrics" aria-label="Context pack summary">
+                <div>
+                  <span>输入</span>
+                  <strong>{formatContextTokens(contextEstimatedTokens)}</strong>
+                </div>
+                <div>
+                  <span>纳入</span>
+                  <strong>{contextReceipt.included_item_count ?? 0}</strong>
+                </div>
+                <div>
+                  <span>丢弃</span>
+                  <strong>{contextReceipt.dropped_item_count ?? 0}</strong>
+                </div>
+                <div>
+                  <span>截断</span>
+                  <strong>{contextReceipt.truncated_item_count ?? 0}</strong>
+                </div>
+              </div>
+              {contextPerformance ? (
+                <div
+                  className={`context-performance ${contextPerformance.status === "warning" ? "warning" : ""}`}
+                  data-testid="context-performance"
+                >
+                  <div>
+                    <span>物化</span>
+                    <strong>{formatContextDuration(contextPerformance.materialize_us)}</strong>
+                  </div>
+                  <div>
+                    <span>装配</span>
+                    <strong>{formatContextDuration(contextPerformance.build_us)}</strong>
+                  </div>
+                  <div>
+                    <span>落盘</span>
+                    <strong>{formatContextDuration(contextPerformance.persist_us)}</strong>
+                  </div>
+                  <div>
+                    <span>请求序列化</span>
+                    <strong>{formatContextDuration(contextPerformance.provider_payload_serialize_us)}</strong>
+                  </div>
+                  <div>
+                    <span>请求体</span>
+                    <strong>{formatBytes(contextPerformance.provider_payload_bytes)}</strong>
+                  </div>
+                  {contextPerformance.warning_codes?.length ? (
+                    <p>
+                      {contextPerformance.warning_codes.map(contextPerformanceWarningLabel).join(" · ")}
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+              {contextInputLimit ? (
+                <div className="context-budget">
+                  <div>
+                    <span>模型输入预算</span>
+                    <strong>
+                      {formatContextTokens(contextEstimatedTokens)} / {formatContextTokens(contextInputLimit)}
+                    </strong>
+                  </div>
+                  <div className="context-budget-track" aria-label={`Context budget ${contextBudgetPercent}%`}>
+                    <span style={{ width: `${contextBudgetPercent}%` }} />
+                  </div>
+                </div>
+              ) : null}
+              <div className="context-meta-strip">
+                <span>稳定前缀 {contextPrefixStatus}</span>
+                <span>{contextReceipt.message_count ?? 0} 条消息</span>
+                <span>{contextReceipt.tool_manifest_count ?? 0} 个工具</span>
+                {contextLatest?.rebuilt ? <span>已压缩重建</span> : null}
+              </div>
+              <div className="context-source-list" aria-label="Context source decisions">
+                {contextTrace.slice(0, 12).map((entry, index) => (
+                  <div
+                    className={`context-source-row ${entry.included ? "included" : "dropped"} ${entry.truncated ? "truncated" : ""}`}
+                    key={`${entry.kind ?? "context"}:${entry.source ?? "source"}:${index}`}
+                  >
+                    <span className="context-source-dot" />
+                    <div>
+                      <strong>{contextKindLabel(entry.kind)}</strong>
+                      <small title={entry.source}>{entry.source || "runtime"}</small>
+                    </div>
+                    <span>
+                      {contextDecisionLabel(entry)} · {formatContextTokens(entry.token_estimate)} tok
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {contextTrace.length > 12 ? (
+                <p className="muted-line">另有 {contextTrace.length - 12} 个来源，可从诊断 API 获取完整列表。</p>
+              ) : null}
+              <div className="context-hash-line">
+                <span>Pack</span>
+                <code>{compactId(contextReceipt.pack_hash)}</code>
+                <span>{activeContextDiagnostics?.history_count ?? 0} 次构建</span>
+              </div>
+            </>
+          ) : (
+            <p className="muted-line">
+              {activeSessionId
+                ? "该会话还没有构建 Context Pack；发送消息后会在这里解释上下文来源和预算。"
+                : "选择一个会话后查看上下文装配诊断。"}
+            </p>
+          )}
         </div>
         <div className="inspector-card">
           <div className="inspector-title">
@@ -7278,6 +8011,24 @@ function EventContent({ event }: { event: AppEvent }) {
 
   const params = event.params ?? {};
   const status = processEventStatus(event);
+  const isTerminalFailure = event.method === "turn/failed" || event.method === "turn/interrupted";
+  const isProviderRecovery = event.method === "turn/retrying" || event.method === "turn/fallback";
+  const friendlyTitle =
+    event.method === "turn/interrupted"
+      ? "任务已停止"
+      : event.method === "turn/failed"
+        ? "模型请求未完成"
+        : event.method === "turn/retrying"
+          ? "正在重试模型请求"
+          : "备用模型继续执行";
+  const friendlyHint =
+    event.method === "turn/failed"
+      ? "可以重试任务，或前往 Settings → 配置验证当前 Provider。"
+      : event.method === "turn/retrying"
+        ? "Runtime 会在短暂等待后自动继续。"
+        : event.method === "turn/fallback"
+          ? "主模型暂不可用，Runtime 已改用备用模型继续。"
+          : "";
   return (
     <details className={`live-tool-event-details ${statusClass(status)}`} data-testid="process-event-details">
       <summary className="live-tool-event-summary">
@@ -7286,7 +8037,15 @@ function EventContent({ event }: { event: AppEvent }) {
         {status ? <small>{status}</small> : null}
         <b className="live-tool-event-action" />
       </summary>
-      <pre>{JSON.stringify(params, null, 2)}</pre>
+      {isTerminalFailure || isProviderRecovery ? (
+        <div className={`process-event-friendly-detail ${isTerminalFailure ? "terminal" : ""}`}>
+          <strong>{friendlyTitle}</strong>
+          <p>{processEventSummary(event)}</p>
+          {friendlyHint ? <small>{friendlyHint}</small> : null}
+        </div>
+      ) : (
+        <pre>{JSON.stringify(params, null, 2)}</pre>
+      )}
     </details>
   );
 }
@@ -7294,9 +8053,10 @@ function EventContent({ event }: { event: AppEvent }) {
 function liveTurnProcessState(events: AppEvent[], isStreaming: boolean): { label: string; tone: string } {
   const hasFailure = events.some((event) => {
     const status = processEventStatus(event);
-    return event.method === "turn/failed" || event.method === "turn/interrupted" || status === "失败" || status === "failed";
+    return event.method === "turn/failed" || status === "失败" || status === "failed";
   });
-  if (hasFailure) return { label: "已停止", tone: "failed" };
+  if (hasFailure) return { label: "运行失败", tone: "failed" };
+  if (events.some((event) => event.method === "turn/interrupted")) return { label: "已停止", tone: "failed" };
 
   const hasPending = events.some((event) => {
     const status = processEventStatus(event);
