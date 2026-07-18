@@ -1593,6 +1593,16 @@ fn bridge_binary_candidates(core_root: &Path) -> Vec<DiagnosticPath> {
     if let Some(path) = env::var_os("OPENAGENT_HTTP_RUNTIME") {
         candidates.push(diagnostic_path("env", PathBuf::from(path)));
     }
+    if development_runtime_fallback_enabled() {
+        candidates.push(diagnostic_path(
+            "core-target-release",
+            core_root.join("target").join("release").join(binary),
+        ));
+        candidates.push(diagnostic_path(
+            "core-target-debug",
+            core_root.join("target").join("debug").join(binary),
+        ));
+    }
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(diagnostic_path("bundle-next-to-exe", dir.join(binary)));
@@ -1605,14 +1615,6 @@ fn bridge_binary_candidates(core_root: &Path) -> Vec<DiagnosticPath> {
     if !development_runtime_fallback_enabled() {
         return candidates;
     }
-    candidates.push(diagnostic_path(
-        "core-target-debug",
-        core_root.join("target").join("debug").join(binary),
-    ));
-    candidates.push(diagnostic_path(
-        "core-target-release",
-        core_root.join("target").join("release").join(binary),
-    ));
     candidates.push(diagnostic_path(
         "repo-target-debug",
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
