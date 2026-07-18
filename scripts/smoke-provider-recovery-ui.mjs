@@ -117,8 +117,8 @@ function startFakeProvider(port) {
       const payload = JSON.parse(raw || "{}");
       models.push(payload.model || "");
       if (requestCount !== 3 && requestCount !== 8) {
-        response.writeHead(502, { "content-type": "application/json" });
-        response.end(JSON.stringify({ error: { message: "Upstream service temporarily unavailable", type: "upstream_error" } }));
+        response.writeHead(503, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "Service temporarily unavailable", type: "api_error" } }));
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
@@ -221,7 +221,11 @@ async function main() {
     await retryButton.waitFor({ state: "visible", timeout: 15_000 });
     const errorText = await page.locator(".error-line").textContent();
     assert.match(errorText || "", /模型服务暂时不可用/);
-    assert.doesNotMatch(errorText || "", /provider returned HTTP 502/i);
+    assert.match(errorText || "", /HTTP 503/);
+    assert.doesNotMatch(errorText || "", /provider returned HTTP 503/i);
+    const processCardText = await page.locator('[data-testid="live-turn-process-card"]').last().textContent();
+    assert.match(processCardText || "", /模型服务暂时不可用/);
+    assert.doesNotMatch(processCardText || "", /provider returned HTTP 503|session_\d+|turn_\d+/i);
     await retryButton.click();
     await page.getByText("PROVIDER_RECOVERY_SUCCEEDED", { exact: false }).waitFor({ state: "visible", timeout: 15_000 });
     assert.deepEqual(provider.models, [

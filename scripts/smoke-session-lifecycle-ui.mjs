@@ -273,6 +273,20 @@ async function main() {
     assert.equal(await page.getByTitle("More").count(), 0, "inert topbar menu should be hidden");
     await page.getByRole("button", { name: "已安排" }).click();
     await page.locator(".inspector.open").waitFor({ state: "visible", timeout: 10_000 });
+    const contextCard = page.getByTestId("context-inspector-card");
+    await contextCard.waitFor({ state: "visible", timeout: 10_000 });
+    const contextText = (await contextCard.textContent()) || "";
+    assert.ok(contextText.includes("上下文"), "context diagnostics card missing");
+    assert.ok(contextText.includes("已装配"), `context diagnostics unavailable: ${contextText}`);
+    assert.ok(contextText.includes("会话消息"), `context source decisions missing: ${contextText}`);
+    assert.ok(contextText.includes("稳定前缀"), `prefix cache diagnostics missing: ${contextText}`);
+    await contextCard.getByTestId("context-replay-button").click();
+    await contextCard.getByTestId("context-replay-result").waitFor({ state: "visible", timeout: 10_000 });
+    const replayText = (await contextCard.getByTestId("context-replay-result").textContent()) || "";
+    assert.ok(
+      replayText.includes("已验证") || replayText.includes("已安全重建"),
+      `context replay did not complete safely: ${replayText}`,
+    );
     await page.getByTitle("Close").click();
     await page.getByRole("button", { name: "插件" }).click();
     await page.locator(".settings-shell").waitFor({ state: "visible", timeout: 10_000 });
@@ -323,6 +337,11 @@ async function main() {
     await page.locator(".inspector.open").waitFor({ state: "visible", timeout: 10_000 });
     const restartedInspector = (await page.locator(".inspector").textContent()) || "";
     assert.equal(restartedInspector.includes("beta-only.txt"), false, "Bridge restart leaked Beta inspector state into Alpha");
+    assert.ok(restartedInspector.includes("已装配"), "context diagnostics did not survive Bridge restart");
+    await page.locator('[data-testid="context-performance"]').waitFor({ state: "visible", timeout: 10_000 });
+    const contextPerformance = (await page.locator('[data-testid="context-performance"]').textContent()) || "";
+    assert.ok(contextPerformance.includes("装配"), "context build performance was not rendered");
+    assert.ok(contextPerformance.includes("请求体"), "provider payload performance was not rendered");
     await page.getByTitle("Close").click();
 
     await betaButton.click();
