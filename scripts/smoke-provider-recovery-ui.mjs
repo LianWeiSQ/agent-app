@@ -97,6 +97,7 @@ async function bridgeJson(port, method, urlPath, body) {
 
 function startFakeProvider(port) {
   const models = [];
+  const payloads = [];
   const server = http.createServer((request, response) => {
     if (request.method === "GET" && request.url === "/v1/models") {
       response.writeHead(200, { "content-type": "application/json" });
@@ -116,6 +117,7 @@ function startFakeProvider(port) {
       const requestCount = models.length + 1;
       const payload = JSON.parse(raw || "{}");
       models.push(payload.model || "");
+      payloads.push(payload);
       if (requestCount !== 3 && requestCount !== 8) {
         response.writeHead(503, { "content-type": "application/json" });
         response.end(JSON.stringify({ error: { message: "Service temporarily unavailable", type: "api_error" } }));
@@ -131,7 +133,7 @@ function startFakeProvider(port) {
   });
   return new Promise((resolve, reject) => {
     server.on("error", reject);
-    server.listen(port, "127.0.0.1", () => resolve({ server, models }));
+    server.listen(port, "127.0.0.1", () => resolve({ server, models, payloads }));
   });
 }
 
@@ -228,11 +230,21 @@ async function main() {
     assert.doesNotMatch(processCardText || "", /provider returned HTTP 503|session_\d+|turn_\d+/i);
     await retryButton.click();
     await page.getByText("PROVIDER_RECOVERY_SUCCEEDED", { exact: false }).waitFor({ state: "visible", timeout: 15_000 });
+    await retryButton.waitFor({ state: "hidden", timeout: 10_000 });
+    assert.equal(await page.locator(".error-line").count(), 0, "stale provider error should disappear after recovery");
+    const recoveredProcessCard = page.locator('[data-testid="live-turn-process-card"]').last();
+    await recoveredProcessCard.locator(".live-turn-process-summary").click();
+    await recoveredProcessCard.getByText("已恢复任务", { exact: true }).waitFor({ state: "visible", timeout: 10_000 });
     assert.deepEqual(provider.models, [
       "gpt-5.5", "gpt-5.5", "gpt-5.4",
       "gpt-5.5", "gpt-5.5", "gpt-5.4", "gpt-5.4",
       "gpt-5.5",
     ]);
+    const manualRetryPayload = provider.payloads[7];
+    const repeatedManualPrompts = (manualRetryPayload.input || []).filter(
+      (item) => item.role === "user" && item.content === "MANUAL_RECOVERY_REQUEST",
+    );
+    assert.equal(repeatedManualPrompts.length, 1, "manual retry must not duplicate the user prompt");
     assert.deepEqual(pageErrors, [], `page errors: ${pageErrors.join("\n")}`);
 
     process.stdout.write(`${JSON.stringify({ ok: true, session_id: sessionId, provider_requests: provider.models.length, automatic_retry: true, fallback: true, manual_recovery: true }, null, 2)}\n`);

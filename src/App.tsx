@@ -15,9 +15,11 @@ import {
   GitBranch,
   GitCompare,
   History,
+  ListChecks,
   PanelRight,
   PencilLine,
   Paperclip,
+  Pause,
   Play,
   PlugZap,
   Plus,
@@ -31,6 +33,7 @@ import {
   Sidebar,
   Square,
   Terminal,
+  Target,
   Trash2,
   Undo2,
   Wrench,
@@ -38,6 +41,22 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { Fragment, type CSSProperties, type FormEvent, type KeyboardEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ReviewWorkspace,
+  type ReviewDiffRow,
+  type ReviewFile,
+  type ReviewPatch,
+} from "./features/review/ReviewWorkspace";
+import {
+  TaskTreeInspector,
+  TaskTreeSummary,
+  flatTaskTree,
+  taskNodeId,
+  taskStatus,
+  type SessionTaskNode,
+  type SessionTaskTreePayload,
+  type TaskLifecycleAction,
+} from "./features/tasks/TaskTree";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -64,13 +83,22 @@ function isMissingSessionError(error: unknown): boolean {
   const code = typeof body?.code === "string" ? body.code : "";
   const bodyError = typeof body?.error === "string" ? body.error : "";
   const text = `${message}\n${code}\n${bodyError}`.toLowerCase();
+  const sessionPath =
+    error instanceof ApiError &&
+    /^\/api\/sessions\/[^/?]+(?:\/|$)/.test(error.path);
   return (
-    (error instanceof ApiError && error.status === 404) ||
     code === "session_not_found" ||
     text.includes("session not found") ||
     text.includes("session state not found") ||
-    text.includes("no such file or directory")
+    (sessionPath && text.includes("no such file or directory"))
   );
+}
+
+function isUnsupportedEndpointError(error: unknown): boolean {
+  if (!(error instanceof ApiError) || error.status !== 404) return false;
+  const code = typeof error.body?.code === "string" ? error.body.code.toLowerCase() : "";
+  const bodyError = typeof error.body?.error === "string" ? error.body.error.toLowerCase() : "";
+  return code === "endpoint_not_found" || bodyError === "unknown endpoint";
 }
 
 function errorDiagnosticText(error: unknown): string {
@@ -135,6 +163,73 @@ type SessionSummary = {
   metadata?: JsonRecord;
 };
 
+type ChangeReviewDecision = {
+  status?: "accepted" | "changes_requested";
+  patch_id?: string;
+  path?: string;
+  run_id?: string;
+  updated_at_ms?: number;
+};
+
+type DurableGoalStatus = "active" | "paused" | "completed";
+
+type DurableGoal = {
+  schema_version: string;
+  id: string;
+  title: string;
+  objective: string;
+  acceptance_criteria?: string[];
+  status: DurableGoalStatus;
+  revision: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+  completed_at_ms?: number | null;
+};
+
+type SessionGoalPayload = {
+  schema_version?: string;
+  session_id?: string;
+  goal?: DurableGoal | null;
+};
+
+type GoalDraft = {
+  title: string;
+  objective: string;
+  acceptanceCriteria: string;
+};
+
+const EMPTY_GOAL_DRAFT: GoalDraft = { title: "", objective: "", acceptanceCriteria: "" };
+
+type DurablePlanStatus = "planning" | "executing" | "completed";
+
+type DurablePlan = {
+  schema_version: string;
+  id: string;
+  title: string;
+  objective: string;
+  steps?: string[];
+  status: DurablePlanStatus;
+  revision: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+  execution_started_at_ms?: number | null;
+  completed_at_ms?: number | null;
+};
+
+type SessionPlanPayload = {
+  schema_version?: string;
+  session_id?: string;
+  plan?: DurablePlan | null;
+};
+
+type PlanDraft = {
+  title: string;
+  objective: string;
+  steps: string;
+};
+
+const EMPTY_PLAN_DRAFT: PlanDraft = { title: "", objective: "", steps: "" };
+
 type CreateSessionPayload = {
   session_id?: string;
   id?: string;
@@ -186,15 +281,54 @@ type ProtocolPayload = {
 };
 
 type ProviderPayload = {
+  schema_version?: string;
   healthy?: boolean;
   provider?: string;
   provider_label?: string;
+  base_url?: string;
+  wire_api?: string;
   model?: string;
   model_count?: number;
   model_endpoint_ok?: boolean;
+  model_endpoint_checked?: boolean;
+  model_endpoint?: string;
+  model_endpoint_message?: string;
   configured_model_available?: boolean;
   api_key?: string;
-  models?: Array<{ id?: string; default?: boolean }>;
+  config?: ProviderConfigPayload;
+  providers?: ProviderProfileSummary[];
+  models?: ProviderModelSummary[];
+};
+
+type ProviderModelCapabilities = {
+  input_modalities?: string[];
+  output_modalities?: string[];
+  responses?: boolean;
+  chat_completions?: boolean;
+  streaming?: boolean;
+  reasoning?: boolean;
+  context_window?: number | null;
+  tools?: boolean;
+  selectable?: boolean;
+};
+
+type ProviderModelSummary = {
+  id?: string;
+  name?: string;
+  provider_id?: string;
+  profile?: string;
+  source?: string;
+  default?: boolean;
+  capabilities?: ProviderModelCapabilities;
+};
+
+type ProviderProfileSummary = {
+  id?: string;
+  provider_id?: string;
+  label?: string;
+  default_base_url?: string;
+  default_model?: string;
+  wire_apis?: string[];
 };
 
 type McpServerSummary = {
@@ -220,6 +354,19 @@ type McpServerSummary = {
   lifecycle_started_at?: number | null;
   lifecycle_last_refreshed_at?: number | null;
   lifecycle_tool_count?: number | null;
+  oauth?: McpOAuthSummary;
+};
+
+type McpOAuthSummary = {
+  supported?: boolean;
+  status?: string;
+  connected?: boolean;
+  pending?: boolean;
+  refreshable?: boolean;
+  expires_at?: number | null;
+  connected_at?: number | null;
+  authorization_server?: string | null;
+  last_error?: string | null;
 };
 
 type McpPayload = {
@@ -235,6 +382,11 @@ type McpPayload = {
   status?: string;
   error?: string | null;
   servers?: McpServerSummary[];
+  oauth_login?: {
+    server_name?: string;
+    authorization_url?: string;
+    status?: string;
+  };
 };
 
 type McpServerDraft = {
@@ -248,6 +400,46 @@ type McpServerDraft = {
   env: string;
   headers: string;
   timeoutMs: string;
+};
+
+type PluginSummary = {
+  id?: string;
+  name?: string;
+  version?: string;
+  description?: string;
+  source?: string;
+  source_type?: string;
+  enabled?: boolean;
+  skills?: string[];
+  skill_count?: number;
+  enabled_skill_count?: number;
+  permissions?: string[];
+  installed_at_ms?: number;
+  updated_at_ms?: number;
+};
+
+type ManagedSkillSummary = {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  plugin_id?: string | null;
+  source?: string;
+  metadata?: JsonRecord;
+};
+
+type PluginsPayload = {
+  schema_version?: string;
+  plugins?: PluginSummary[];
+  plugin_count?: number;
+  enabled_plugin_count?: number;
+  skills?: ManagedSkillSummary[];
+  skill_count?: number;
+  issues?: Array<{ kind?: string; path?: string; message?: string }>;
+  runtime?: {
+    enabled_plugins?: string[];
+    extra_skill_root_count?: number;
+    disabled_skills?: string[];
+  };
 };
 
 type PendingApproval = {
@@ -293,6 +485,20 @@ type ContextTraceSummary = {
   truncation_reason?: string | null;
   truncation_strategy?: string | null;
   semantic_duplicate?: boolean;
+  attachment?: {
+    id?: string;
+    kind?: AttachmentKind;
+    name?: string | null;
+    content_type?: string;
+    size_bytes?: number;
+    source?: string | null;
+    page_count?: number | null;
+    media_metadata?: JsonRecord;
+    source_truncated?: boolean;
+    source_truncation_reason?: string | null;
+    original_content_bytes?: number | null;
+    included_content_bytes?: number | null;
+  } | null;
 };
 
 type ContextReceipt = {
@@ -414,26 +620,42 @@ type FileEntry = {
   text?: boolean;
 };
 
+type AttachmentKind = "file" | "image" | "pdf" | "document" | "folder" | "text";
+
 type ComposerAttachment = {
   id: string;
-  kind: "file";
+  kind: AttachmentKind;
   path: string;
   name: string;
   sizeBytes: number;
   contentType: string;
   content: string;
+  source?: string;
+  pageCount?: number;
+  mediaMetadata?: JsonRecord;
+  truncated?: boolean;
+  truncationReason?: string;
+  originalContentBytes?: number;
+  includedContentBytes?: number;
   error?: string | null;
 };
 
 type AttachmentSummary = {
   id?: string;
-  kind: "file";
+  kind: AttachmentKind;
   path: string;
   name: string;
   sizeBytes: number;
   contentType: string;
   contentChars?: number;
   contentLines?: number;
+  source?: string;
+  pageCount?: number;
+  mediaMetadata?: JsonRecord;
+  truncated?: boolean;
+  truncationReason?: string;
+  originalContentBytes?: number;
+  includedContentBytes?: number;
 };
 
 type FilesPayload = {
@@ -455,6 +677,20 @@ type GitChange = {
   index?: string;
   worktree?: string;
   path?: string;
+  additions?: number;
+  deletions?: number;
+  binary?: boolean;
+};
+
+type GitSelectedDiff = {
+  path?: string;
+  status?: string;
+  source?: string;
+  diff?: string;
+  additions?: number;
+  deletions?: number;
+  binary?: boolean;
+  truncated?: boolean;
 };
 
 type GitPayload = {
@@ -465,23 +701,189 @@ type GitPayload = {
   behind?: number;
   changes?: GitChange[];
   change_count?: number;
+  selected_diff?: GitSelectedDiff | null;
   error?: string;
 };
 
-type TerminalRunResult = {
-  command?: string;
+type GitWorkflowSummary = {
+  title?: string;
+  body?: string;
+  base_branch?: string;
+  head_branch?: string;
+  file_count?: number;
+  additions?: number;
+  deletions?: number;
+  commits?: string[];
+  generated_at_ms?: number;
+};
+
+type GitWorkflowResult = {
+  action?: string;
+  status?: string;
+  branch?: string;
+  base_branch?: string;
+  commit?: string;
+  message?: string;
+  paths?: string[];
+  title?: string;
+  head_branch?: string;
+  url?: string;
+  error?: string;
+  updated_at_ms?: number;
+};
+
+type GitWorkflowPayload = {
+  schema_version?: string;
+  session_id?: string;
+  workspace?: string;
+  is_repo?: boolean;
+  branch?: string;
+  base_branch?: string;
+  head_sha?: string;
+  head_subject?: string;
+  ahead?: number;
+  behind?: number;
+  changes?: GitChange[];
+  change_count?: number;
+  summary?: GitWorkflowSummary | null;
+  handoff?: GitWorkflowResult | null;
+  last_result?: GitWorkflowResult | null;
+  pending?: JsonRecord | null;
+};
+
+type GitWorkflowAction = "create_branch" | "commit" | "create_pr";
+
+type TerminalChunk = {
+  sequence: number;
+  stream: "stdout" | "stderr";
+  text: string;
+};
+
+type TerminalSessionPayload = {
+  terminal_id: string;
+  session_id?: string | null;
   workspace?: string;
   cwd?: string;
   cwd_relative?: string;
-  success?: boolean;
-  exit_code?: number;
-  timed_out?: boolean;
-  timeout_ms?: number;
+  shell?: string;
+  status?: "running" | "completed" | "failed" | "interrupted";
+  running?: boolean;
+  exit_code?: number | null;
+  started_at_ms?: number;
+  finished_at_ms?: number | null;
+  chunks?: TerminalChunk[];
+  cursor?: number;
+  truncated_before?: number;
+};
+
+type TerminalSessionsPayload = {
+  terminals?: TerminalSessionPayload[];
+};
+
+type CapabilityPolicy = "allow" | "ask" | "deny";
+
+type CapabilitySummary = {
+  id: "browser" | "computer" | "terminal";
+  label?: string;
+  description?: string;
+  backend?: string;
+  tools?: string[];
+  enabled?: boolean;
+  policy?: CapabilityPolicy;
+  available?: boolean;
+  status?: string;
+  diagnostic?: string | null;
+  availability_error?: string | null;
+  last_checked_at_ms?: number | null;
+  last_error?: string | null;
+};
+
+type CapabilitiesPayload = {
+  schema_version?: string;
+  storage?: string;
+  updated_at_ms?: number;
+  capabilities?: CapabilitySummary[];
+};
+
+type PerformanceProfile = {
+  id: string;
+  label: string;
+  status?: "passed" | "warning" | string;
   duration_ms?: number;
-  stdout?: string;
-  stderr?: string;
-  stdout_truncated?: boolean;
-  stderr_truncated?: boolean;
+  budget_ms?: number;
+  coverage?: "full_scale" | "sampled" | string;
+  target?: number;
+  scale_key?: string;
+  observed?: number;
+  scale?: JsonRecord;
+};
+
+type PerformanceProbe = {
+  schema_version?: string;
+  session_id?: string | null;
+  measured_at_ms?: number;
+  status?: "passed" | "warning" | string;
+  warning_count?: number;
+  full_scale_count?: number;
+  profile_count?: number;
+  total_duration_ms?: number;
+  profiles?: PerformanceProfile[];
+  privacy?: {
+    content_included?: boolean;
+    paths_included?: boolean;
+    credentials_included?: boolean;
+  };
+};
+
+type PerformanceStatusPayload = {
+  schema_version?: string;
+  session_id?: string | null;
+  latest?: PerformanceProbe | null;
+  budgets?: JsonRecord;
+};
+
+type StorageMigrationSummary = {
+  migration_id?: string;
+  target_schema_set?: string;
+  status?: string;
+  created_at_ms?: number;
+  completed_at_ms?: number | null;
+  rolled_back_at_ms?: number | null;
+  action_count?: number;
+  changed_file_count?: number;
+  backup_file_count?: number;
+  error_code?: string | null;
+};
+
+type StorageStatusPayload = {
+  schema_version?: string;
+  target_schema_set?: string;
+  readiness?: "ready" | "needs_migration" | "blocked" | string;
+  session_count?: number;
+  current_session_count?: number;
+  legacy_session_count?: number;
+  blocked_session_count?: number;
+  runtime_state_count?: number;
+  current_runtime_state_count?: number;
+  legacy_runtime_state_count?: number;
+  transcript_record_count?: number;
+  compatible_legacy_record_count?: number;
+  planned_action_count?: number;
+  blocked_count?: number;
+  blocked_reasons?: Record<string, number>;
+  can_migrate?: boolean;
+  can_rollback?: boolean;
+  latest_migration?: StorageMigrationSummary | null;
+  rollback_candidate?: StorageMigrationSummary | null;
+  migration?: StorageMigrationSummary | null;
+};
+
+type CapabilityDiagnosticResult = {
+  ok?: boolean;
+  capability_id?: string;
+  message?: string | null;
+  error?: string | null;
+  state?: CapabilitiesPayload;
 };
 
 type MessageInfo = {
@@ -549,6 +951,24 @@ type StreamingDraft = {
 type LiveFinalAnswer = {
   turnId: string;
   text: string;
+  result?: FinalResult;
+};
+
+type FinalResultItem = {
+  kind?: string;
+  label?: string;
+  path?: string;
+  tool?: string;
+  status?: string;
+};
+
+type FinalResult = {
+  schemaVersion?: string;
+  runId?: string;
+  summary: string;
+  changed: FinalResultItem[];
+  verified: FinalResultItem[];
+  remaining: FinalResultItem[];
 };
 
 type TrustHistoryItem = {
@@ -624,12 +1044,20 @@ type ProviderEnvPreview = {
 };
 
 type ProviderConfigPayload = {
+  schema_version?: string;
+  provider?: string;
   profile?: string;
   profile_label?: string;
   base_url?: string;
+  base_url_source?: string;
   model?: string;
+  model_source?: string;
   wire_api?: string;
+  wire_api_source?: string;
   api_key_configured?: boolean;
+  api_key_source?: string | null;
+  storage?: string;
+  updated_at_ms?: number | null;
   env_file?: string;
   env_preview?: ProviderEnvPreview[];
 };
@@ -648,6 +1076,7 @@ type ProviderValidationResult = {
   response_status?: number | null;
   message?: string;
   sample?: string | null;
+  models?: ProviderModelSummary[];
 };
 
 type ProviderDraft = {
@@ -687,6 +1116,17 @@ type ManagedBridgeStatus = {
   binary?: string | null;
   provider?: DesktopProviderEnvSummary;
   error?: string | null;
+  lifecycle?: "stopped" | "starting" | "running" | "recovering" | "failed" | string;
+  generation?: number;
+  recovery_count?: number;
+  unexpected_exit_count?: number;
+  last_exit_at_ms?: number | null;
+  recovered_at_ms?: number | null;
+};
+
+type BridgeRecoveryView = {
+  phase: "idle" | "recovering" | "recovered" | "failed";
+  message: string;
 };
 
 type ProjectPathInfo = {
@@ -722,6 +1162,8 @@ type SettingsPage =
   | "connections"
   | "git"
   | "environment"
+  | "performance"
+  | "storage"
   | "worktree"
   | "archived";
 
@@ -764,9 +1206,9 @@ const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; model: 
   glm: {
     label: "GLM / OpenAI compatible",
     baseUrl: "https://open.bigmodel.cn/api/paas/v4",
-    model: "glm-4.5",
+    model: "glm-5.2",
     wireApi: "chat",
-    models: ["glm-4.5", "glm-4.5-air", "glm-4-flash", "glm-4-plus"],
+    models: ["glm-5.2", "glm-4.5", "glm-4.5-air", "glm-4-plus", "glm-4-flash"],
   },
 };
 
@@ -918,6 +1360,16 @@ function storedActiveSessions(): Record<string, string> {
 
 function storedActiveSession(projectPath: string): string {
   return storedActiveSessions()[normalizeProjectPath(projectPath)] ?? "";
+}
+
+function persistActiveProject(projectPath: string): void {
+  if (typeof window === "undefined") return;
+  const normalized = normalizeProjectPath(projectPath);
+  if (normalized) {
+    window.localStorage.setItem(STORAGE_ACTIVE_PROJECT, normalized);
+  } else {
+    window.localStorage.removeItem(STORAGE_ACTIVE_PROJECT);
+  }
 }
 
 function persistActiveSession(projectPath: string, session: string): void {
@@ -1343,6 +1795,21 @@ function formatBytes(value?: number): string {
   return `${(value / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function performanceScaleLabel(profile: PerformanceProfile): string {
+  const observed = profile.observed ?? 0;
+  const target = profile.target ?? 0;
+  const value = profile.scale_key === "attachment_bytes" ? formatBytes(observed) : observed.toLocaleString();
+  const targetValue = profile.scale_key === "attachment_bytes" ? formatBytes(target) : target.toLocaleString();
+  const units: Record<string, string> = {
+    files: "个文件",
+    messages: "条消息",
+    changed_lines: "行变更",
+    tasks: "个任务",
+  };
+  const unit = units[profile.scale_key ?? ""] ?? "";
+  return `${value}${unit ? ` ${unit}` : ""} / 目标 ${targetValue}${unit ? ` ${unit}` : ""}`;
+}
+
 function formatContextTokens(value?: number): string {
   const tokens = value ?? 0;
   if (tokens < 1000) return `${tokens}`;
@@ -1384,10 +1851,14 @@ function contextKindLabel(kind?: string): string {
     tool_result: "工具结果",
     attachment_file: "附件",
     attachment_image: "图片",
+    attachment_pdf: "PDF",
+    attachment_document: "文档",
     skill_preloaded: "已加载 Skill",
     skill_available: "Skill 目录",
     mcp_tool_manifest: "MCP 工具",
     todo: "Todo",
+    goal: "长期目标",
+    plan: "计划模式",
     checkpoint: "Checkpoint",
     work_state: "工作状态",
     sandbox: "执行环境",
@@ -1401,6 +1872,22 @@ function contextDecisionLabel(entry: ContextTraceSummary): string {
   if (entry.delivery === "trace_only") return "已嵌入";
   if (entry.delivery === "tool_manifest") return "工具定义";
   return "已纳入";
+}
+
+function contextAttachmentDetail(entry: ContextTraceSummary): string {
+  const attachment = entry.attachment;
+  if (!attachment) return entry.source || "runtime";
+  const media = attachment.media_metadata ?? {};
+  const width = numberField(media, "width_px");
+  const height = numberField(media, "height_px");
+  return [
+    contextKindLabel(`attachment_${attachment.kind || "file"}`),
+    formatBytes(attachment.size_bytes),
+    attachment.page_count ? `${attachment.page_count} 页` : "",
+    width && height ? `${width}×${height}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function contextReplayLabel(status?: ContextReplaySummary["status"]): string {
@@ -1437,17 +1924,31 @@ function attachmentName(path: string, fallback = "attachment"): string {
   return normalized.split("/").filter(Boolean).pop() || fallback;
 }
 
+function attachmentKind(value: unknown): AttachmentKind {
+  const kind = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return ["file", "image", "pdf", "document", "folder", "text"].includes(kind)
+    ? (kind as AttachmentKind)
+    : "file";
+}
+
 function normalizeComposerAttachment(item: Partial<ComposerAttachment>, index: number): ComposerAttachment {
   const path = firstText(item.path);
   const name = firstText(item.name) || attachmentName(path, `attachment-${index + 1}.txt`);
   return {
     id: firstText(item.id) || `${path || name}:${Date.now()}:${index}`,
-    kind: "file",
+    kind: attachmentKind(item.kind),
     path,
     name,
     sizeBytes: typeof item.sizeBytes === "number" ? item.sizeBytes : 0,
     contentType: firstText(item.contentType) || "text/plain",
     content: typeof item.content === "string" ? item.content : "",
+    source: firstText(item.source) || undefined,
+    pageCount: typeof item.pageCount === "number" ? item.pageCount : undefined,
+    mediaMetadata: jsonRecord(item.mediaMetadata) ?? undefined,
+    truncated: Boolean(item.truncated),
+    truncationReason: firstText(item.truncationReason) || undefined,
+    originalContentBytes: typeof item.originalContentBytes === "number" ? item.originalContentBytes : undefined,
+    includedContentBytes: typeof item.includedContentBytes === "number" ? item.includedContentBytes : undefined,
     error: typeof item.error === "string" ? item.error : null,
   };
 }
@@ -1460,6 +1961,13 @@ function attachmentPayload(attachment: ComposerAttachment): JsonRecord {
     size_bytes: attachment.sizeBytes,
     content_type: attachment.contentType,
     content: attachment.content,
+    source: attachment.source,
+    page_count: attachment.pageCount,
+    media_metadata: attachment.mediaMetadata,
+    truncated: attachment.truncated,
+    truncation_reason: attachment.truncationReason,
+    original_content_bytes: attachment.originalContentBytes,
+    included_content_bytes: attachment.includedContentBytes,
   };
 }
 
@@ -1467,13 +1975,26 @@ function attachmentSummariesFromMessage(message: MessageWithParts): AttachmentSu
   const metadata = message.info?.metadata;
   return jsonArray(metadata?.attachments).map((item, index) => ({
     id: firstText(item.id) || `${firstText(item.path, item.name)}:${index}`,
-    kind: "file",
+    kind: attachmentKind(item.kind),
     path: firstText(item.path),
     name: firstText(item.name) || attachmentName(firstText(item.path), `attachment-${index + 1}`),
     sizeBytes: numberField(item, "size_bytes") || numberField(item, "sizeBytes"),
     contentType: firstText(item.content_type, item.contentType) || "text/plain",
     contentChars: numberField(item, "content_chars") || undefined,
     contentLines: numberField(item, "content_lines") || undefined,
+    source: firstText(item.source) || undefined,
+    pageCount: numberField(item, "page_count") || numberField(item, "pageCount") || undefined,
+    mediaMetadata: jsonRecord(item.media_metadata) ?? jsonRecord(item.mediaMetadata) ?? undefined,
+    truncated: Boolean(item.truncated),
+    truncationReason: firstText(item.truncation_reason, item.truncationReason) || undefined,
+    originalContentBytes:
+      numberField(item, "original_content_bytes") || numberField(item, "originalContentBytes") || undefined,
+    includedContentBytes:
+      typeof item.included_content_bytes === "number"
+        ? item.included_content_bytes
+        : typeof item.includedContentBytes === "number"
+          ? item.includedContentBytes
+          : undefined,
   }));
 }
 
@@ -1748,6 +2269,50 @@ function messageContent(message: MessageWithParts): string {
   return "";
 }
 
+function finalResultItem(value: unknown): FinalResultItem | null {
+  const item = jsonRecord(value);
+  if (!item) return null;
+  const result = {
+    kind: firstText(item.kind),
+    label: firstText(item.label),
+    path: firstText(item.path),
+    tool: firstText(item.tool),
+    status: firstText(item.status),
+  };
+  return Object.values(result).some(Boolean) ? result : null;
+}
+
+function finalResultItems(value: unknown): FinalResultItem[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(finalResultItem).filter((item): item is FinalResultItem => Boolean(item));
+}
+
+function finalResultFromValue(value: unknown): FinalResult | null {
+  const payload = jsonRecord(value);
+  if (!payload) return null;
+  const changed = finalResultItems(payload.changed);
+  const verified = finalResultItems(payload.verified);
+  const remaining = finalResultItems(payload.remaining);
+  const summary = firstText(payload.summary);
+  const schemaVersion = firstText(payload.schema_version, payload.schemaVersion);
+  if (!summary && !schemaVersion && changed.length === 0 && verified.length === 0 && remaining.length === 0) {
+    return null;
+  }
+  return {
+    schemaVersion,
+    runId: firstText(payload.run_id, payload.runId),
+    summary,
+    changed,
+    verified,
+    remaining,
+  };
+}
+
+function finalResultFromMessage(message: MessageWithParts): FinalResult | null {
+  const resultPart = [...(message.parts ?? [])].reverse().find((part) => part.kind === "result");
+  return finalResultFromValue(resultPart?.content);
+}
+
 function interactionRequestKey(item: TrustHistoryItem | null): string {
   if (!item) return "";
   const identifier = item.requestId || item.callId;
@@ -1814,6 +2379,7 @@ function visibleMessageParts(
   }
   return parts.filter((part, index) => {
     if (part.kind === "text") return false;
+    if (part.kind === "result") return false;
     if (isCheckpointMessagePart(part)) return false;
     if (isSupersededPendingInteraction(part, resolvedKeys)) return false;
     if (terminalRunStatus && ["tool", "mcp_tool"].includes(part.kind ?? "") && isPendingMessagePart(part)) return false;
@@ -2304,6 +2870,19 @@ function mcpLifecycleStatusClass(server: McpServerSummary): string {
   return "neutral";
 }
 
+function mcpOAuthStatusLabel(server: McpServerSummary): string {
+  if (server.type === "local") return "not_applicable";
+  return server.oauth?.status || "disconnected";
+}
+
+function mcpOAuthStatusClass(server: McpServerSummary): string {
+  const status = mcpOAuthStatusLabel(server);
+  if (status === "connected") return "ok";
+  if (status === "authorizing") return "warn";
+  if (["error", "expired", "stale"].includes(status)) return "bad";
+  return "neutral";
+}
+
 function parseMcpList(value: string): string[] {
   return value
     .split(/\r?\n|,/)
@@ -2398,6 +2977,69 @@ function sideBySideRows(patch: JsonRecord | null | undefined): JsonRecord[] {
   return nestedArray(sideBySide, "rows");
 }
 
+function reviewPatchFromRecord(record: JsonRecord): ReviewPatch | null {
+  const path = stringField(record, "path").trim();
+  if (!path) return null;
+  const sideBySide = nestedRecord(record, "side_by_side");
+  const rows = sideBySideRows(record).map((row): ReviewDiffRow => ({
+    kind: stringField(row, "kind"),
+    old_line: typeof row.old_line === "number" ? row.old_line : null,
+    new_line: typeof row.new_line === "number" ? row.new_line : null,
+    old: typeof row.old === "string" ? row.old : null,
+    new: typeof row.new === "string" ? row.new : null,
+  }));
+  return {
+    id: stringField(record, "id"),
+    path,
+    status: stringField(record, "status"),
+    runId: stringField(record, "run_id"),
+    diff: stringField(record, "diff"),
+    sideBySide: sideBySide
+      ? {
+          oldLabel: stringField(sideBySide, "old_label"),
+          newLabel: stringField(sideBySide, "new_label"),
+          rows,
+          truncated: Boolean(sideBySide.truncated),
+          omittedRows: numberField(sideBySide, "omitted_rows"),
+        }
+      : undefined,
+  };
+}
+
+function reviewPatchFromGit(record: GitSelectedDiff | null | undefined): ReviewPatch | null {
+  const path = record?.path?.trim() ?? "";
+  if (!path) return null;
+  return {
+    path,
+    status: record?.status,
+    diff: record?.diff,
+  };
+}
+
+function changedLineCounts(diff = "") {
+  let additions = 0;
+  let deletions = 0;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
+  }
+  return { additions, deletions };
+}
+
+function changeReviewDecisionFromSession(session?: SessionSummary): ChangeReviewDecision | null {
+  const review = jsonRecord(session?.metadata?.change_review);
+  if (!review) return null;
+  const status = stringField(review, "status");
+  if (status !== "accepted" && status !== "changes_requested") return null;
+  return {
+    status,
+    patch_id: stringField(review, "patch_id"),
+    path: stringField(review, "path"),
+    run_id: stringField(review, "run_id"),
+    updated_at_ms: numberField(review, "updated_at_ms"),
+  };
+}
+
 function diffCellText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
@@ -2477,6 +3119,8 @@ function humanizeToken(value: string): string {
 
 function approvalToolLabel(approval: JsonRecord): string {
   const tool = stringField(approval, "tool_name").toLowerCase();
+  if (tool.startsWith("git_")) return "Git write";
+  if (tool.startsWith("github_")) return "GitHub write";
   if (["write", "edit", "replace"].includes(tool)) return "File write";
   if (["read", "list", "glob", "search"].includes(tool)) return "File read";
   if (["bash", "shell", "command", "terminal"].some((name) => tool.includes(name))) return "Shell command";
@@ -2524,6 +3168,8 @@ function approvalPermissionLabel(approval: JsonRecord): string {
 function approvalRiskLabel(approval: JsonRecord): string {
   const metadata = nestedRecord(approval, "metadata");
   const tool = stringField(approval, "tool_name").toLowerCase();
+  if (tool.startsWith("git_")) return "Risk: changes repository state";
+  if (tool.startsWith("github_")) return "Risk: writes to GitHub";
   const pattern = firstText(
     approval.permission_pattern,
     metadata?.permission_pattern,
@@ -2539,6 +3185,8 @@ function approvalRiskLabel(approval: JsonRecord): string {
 
 function approvalRiskTone(approval: JsonRecord): string {
   const tool = stringField(approval, "tool_name").toLowerCase();
+  if (tool.startsWith("git_")) return "write";
+  if (tool.startsWith("github_")) return "external";
   if (["write", "edit", "replace"].includes(tool)) return "write";
   if (["bash", "shell", "command", "terminal"].some((name) => tool.includes(name))) return "command";
   if (tool.startsWith("mcp") || tool.includes("mcp_")) return "external";
@@ -2850,7 +3498,7 @@ function questionValidationErrors(question: JsonRecord | undefined, requestId: s
 }
 
 function eventIcon(method: string) {
-  if (method === "turn/retrying" || method === "turn/fallback") return <RefreshCw size={16} />;
+  if (method === "turn/retried" || method === "turn/retrying" || method === "turn/fallback") return <RefreshCw size={16} />;
   if (method.includes("toolCall")) return <Wrench size={16} />;
   if (method.includes("question")) return <Bot size={16} />;
   if (method.includes("approval")) return <ShieldCheck size={16} />;
@@ -2871,12 +3519,20 @@ function retryDelayMs(attempt: number): number {
   return Math.min(5000, 750 * Math.max(1, attempt));
 }
 
+const MIN_EMPTY_SSE_CYCLE_MS = 1000;
+
+function emptySseReconnectDelayMs(elapsedMs: number, eventCount: number): number {
+  if (eventCount > 0 || elapsedMs >= MIN_EMPTY_SSE_CYCLE_MS) return 0;
+  return Math.ceil(MIN_EMPTY_SSE_CYCLE_MS - elapsedMs);
+}
+
 function streamStateAfterEvents(events: AppEvent[], fallback: string): string {
   return events.reduce((state, event) => {
     const status = stringParam(event.params ?? {}, "status");
     if (event.method === "turn/completed") return "idle";
     if (event.method === "turn/failed") return "failed";
     if (event.method === "turn/interrupted") return "interrupted";
+    if (event.method === "turn/retried" || event.method === "item/agentMessage/reset") return "running";
     if (event.method === "turn/retrying") return "retrying";
     if (event.method === "turn/fallback") return "running";
     if (event.method === "turn/approval_requested") return "waiting_approval";
@@ -2896,13 +3552,14 @@ function activeTurnIdFromEvents(events: AppEvent[]): string {
   let activeTurnId = "";
   for (const event of events) {
     const turnId = eventTurnId(event);
-    if (event.method === "turn/started" && turnId) {
+    if ((event.method === "turn/started" || event.method === "turn/retried") && turnId) {
       activeTurnId = turnId;
       continue;
     }
     if (
       turnId &&
       (event.method === "item/agentMessage/delta" ||
+        event.method === "item/agentMessage/reset" ||
         event.method === "item/agentMessage/thinking" ||
         event.method === "turn/retrying" ||
         event.method === "turn/fallback" ||
@@ -2929,11 +3586,18 @@ type RetryableTurnFailure = {
   message: string;
   retryable: boolean;
   resumable: boolean;
+  retryCount: number;
+  maxRetries: number;
 };
 
 function latestRetryableTurnFailure(events: AppEvent[]): RetryableTurnFailure | null {
   for (const event of [...events].reverse()) {
-    if (event.method === "turn/completed" || event.method === "turn/interrupted") return null;
+    if (
+      event.method === "turn/completed" ||
+      event.method === "turn/interrupted" ||
+      event.method === "turn/started" ||
+      event.method === "turn/retried"
+    ) return null;
     if (event.method !== "turn/failed") continue;
     const turnId = eventTurnId(event);
     if (!turnId) return null;
@@ -2943,6 +3607,8 @@ function latestRetryableTurnFailure(events: AppEvent[]): RetryableTurnFailure | 
       message: stringParam(params, "error"),
       retryable: params.retryable === true,
       resumable: params.resumable === true,
+      retryCount: Number(params.retry_count ?? 0),
+      maxRetries: Number(params.max_retries ?? 0),
     };
   }
   return null;
@@ -2956,7 +3622,9 @@ function latestTerminalErrorTurnIdFromEvents(events: AppEvent[]): string {
     if (
       event.method === "turn/completed" ||
       event.method === "turn/started" ||
+      event.method === "turn/retried" ||
       event.method === "item/agentMessage/delta" ||
+      event.method === "item/agentMessage/reset" ||
       event.method === "item/agentMessage/thinking" ||
       event.method.includes("toolCall")
     ) {
@@ -2998,6 +3666,13 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
       terminalMethod = "";
       continue;
     }
+    if (event.method === "item/agentMessage/reset" && turnId === currentTurnId) {
+      text = "";
+      eventCount = 0;
+      completed = false;
+      terminalMethod = "";
+      continue;
+    }
     if (
       currentTurnId &&
       (event.method === "turn/completed" ||
@@ -3022,11 +3697,14 @@ function activeStreamingDraftFromEvents(events: AppEvent[]): StreamingDraft | nu
 function liveFinalAnswerFromEvents(events: AppEvent[]): LiveFinalAnswer | null {
   for (const event of [...events].reverse()) {
     if (event.method !== "turn/completed") continue;
-    const text = stringParam(event.params ?? {}, "final_answer");
-    if (!text.trim()) continue;
+    const params = event.params ?? {};
+    const result = finalResultFromValue(params.final_result);
+    const text = stringParam(params, "final_answer") || result?.summary || "";
+    if (!text.trim() && !result) continue;
     return {
       turnId: eventTurnId(event) || "current",
       text,
+      result: result ?? undefined,
     };
   }
   return null;
@@ -3061,12 +3739,14 @@ function sessionEventChanged(method: string): boolean {
   return (
     method.startsWith("turn/") ||
     method === "item/agentMessage/thinking" ||
+    method === "item/agentMessage/reset" ||
     method.includes("toolCall") ||
     method.includes("question") ||
     method.includes("approval") ||
     method.startsWith("context/") ||
     method.includes("checkpoint") ||
-    method.includes("patch")
+    method.includes("patch") ||
+    method.startsWith("git/")
   );
 }
 
@@ -3079,6 +3759,7 @@ function isVisibleProcessEvent(event: AppEvent): boolean {
     method.includes("approval") ||
     method.includes("question") ||
     method.includes("patch") ||
+    method === "turn/retried" ||
     method === "turn/retrying" ||
     method === "turn/fallback" ||
     method === "turn/failed" ||
@@ -3124,6 +3805,14 @@ export function App() {
   const [mcpEditingServerName, setMcpEditingServerName] = useState("");
   const [mcpMutationBusy, setMcpMutationBusy] = useState("");
   const [mcpMutationError, setMcpMutationError] = useState("");
+  const [mcpOAuthPollingServer, setMcpOAuthPollingServer] = useState("");
+  const mcpOAuthPollingStartedAtRef = useRef(0);
+  const [plugins, setPlugins] = useState<PluginsPayload | null>(null);
+  const [pluginSourceDraft, setPluginSourceDraft] = useState("");
+  const [pluginMutationBusy, setPluginMutationBusy] = useState("");
+  const [pluginMutationError, setPluginMutationError] = useState("");
+  const [pluginExpandedId, setPluginExpandedId] = useState("");
+  const [skillFilter, setSkillFilter] = useState("");
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [renamingSessionId, setRenamingSessionId] = useState("");
   const [sessionRenameDraft, setSessionRenameDraft] = useState("");
@@ -3149,9 +3838,18 @@ export function App() {
   const [fileTree, setFileTree] = useState<FilesPayload | null>(null);
   const [filePreview, setFilePreview] = useState<FilesPayload | null>(null);
   const [gitStatus, setGitStatus] = useState<GitPayload | null>(null);
+  const [gitWorkflow, setGitWorkflow] = useState<GitWorkflowPayload | null>(null);
+  const [gitWorkflowBusy, setGitWorkflowBusy] = useState("");
+  const [gitWorkflowError, setGitWorkflowError] = useState("");
   const [sessionMessages, setSessionMessages] = useState<SessionMessagesPayload | null>(null);
   const [turnJobs, setTurnJobs] = useState<TurnJobsPayload>({ turns: [], count: 0, running_count: 0, terminal_count: 0 });
   const [selectedTurnJobId, setSelectedTurnJobId] = useState("");
+  const [sessionTaskTree, setSessionTaskTree] = useState<SessionTaskTreePayload>({ tree: [], flat_tasks: [], count: 0 });
+  const [selectedSessionTaskId, setSelectedSessionTaskId] = useState("");
+  const [taskTreeBusy, setTaskTreeBusy] = useState(false);
+  const [taskTreeError, setTaskTreeError] = useState("");
+  const [taskActionBusy, setTaskActionBusy] = useState("");
+  const [taskActionNotice, setTaskActionNotice] = useState("");
   const [activeSessionId, setActiveSessionId] = useState(() =>
     storedActiveSession(storedValue(STORAGE_ACTIVE_PROJECT, "")),
   );
@@ -3160,6 +3858,18 @@ export function App() {
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [attachmentMenuOpen, setAttachmentMenuOpen] = useState(false);
   const [attachmentError, setAttachmentError] = useState("");
+  const [durableGoal, setDurableGoal] = useState<DurableGoal | null>(null);
+  const [goalPanelOpen, setGoalPanelOpen] = useState(false);
+  const [goalCreatingNew, setGoalCreatingNew] = useState(false);
+  const [goalDraft, setGoalDraft] = useState<GoalDraft>(EMPTY_GOAL_DRAFT);
+  const [goalBusy, setGoalBusy] = useState("");
+  const [goalError, setGoalError] = useState("");
+  const [durablePlan, setDurablePlan] = useState<DurablePlan | null>(null);
+  const [planPanelOpen, setPlanPanelOpen] = useState(false);
+  const [planCreatingNew, setPlanCreatingNew] = useState(false);
+  const [planDraft, setPlanDraft] = useState<PlanDraft>(EMPTY_PLAN_DRAFT);
+  const [planBusy, setPlanBusy] = useState("");
+  const [planError, setPlanError] = useState("");
   const [composerDockHeight, setComposerDockHeight] = useState(164);
   const [permission, setPermission] = useState(() => normalizePermissionMode(storedValue(STORAGE_PERMISSION_MODE, "REQUEST_APPROVAL")));
   const [model, setModel] = useState(() => {
@@ -3176,10 +3886,21 @@ export function App() {
   const [providerConfigError, setProviderConfigError] = useState("");
   const [providerValidation, setProviderValidation] = useState<ProviderValidationResult | null>(null);
   const [providerEnvText, setProviderEnvText] = useState("");
-  const [terminalCommand, setTerminalCommand] = useState("pwd");
-  const [terminalResult, setTerminalResult] = useState<TerminalRunResult | null>(null);
-  const [terminalBusy, setTerminalBusy] = useState(false);
+  const [terminalSession, setTerminalSession] = useState<TerminalSessionPayload | null>(null);
+  const [terminalInput, setTerminalInput] = useState("");
+  const [terminalChunks, setTerminalChunks] = useState<TerminalChunk[]>([]);
+  const [terminalBusy, setTerminalBusy] = useState("");
   const [terminalError, setTerminalError] = useState("");
+  const terminalCursorRef = useRef(0);
+  const [capabilities, setCapabilities] = useState<CapabilitiesPayload>({ capabilities: [] });
+  const [capabilityBusy, setCapabilityBusy] = useState("");
+  const [capabilityError, setCapabilityError] = useState("");
+  const [performanceProbe, setPerformanceProbe] = useState<PerformanceProbe | null>(null);
+  const [performanceBusy, setPerformanceBusy] = useState(false);
+  const [performanceError, setPerformanceError] = useState("");
+  const [storageStatus, setStorageStatus] = useState<StorageStatusPayload | null>(null);
+  const [storageBusy, setStorageBusy] = useState("");
+  const [storageError, setStorageError] = useState("");
   const [connection, setConnection] = useState("offline");
   const [streamState, setStreamState] = useState("idle");
   const [activeTurnId, setActiveTurnId] = useState("");
@@ -3202,6 +3923,7 @@ export function App() {
   const [managedBridge, setManagedBridge] = useState<ManagedBridgeStatus | null>(null);
   const [managedBridgeBusy, setManagedBridgeBusy] = useState("");
   const [managedBridgeError, setManagedBridgeError] = useState("");
+  const [bridgeRecovery, setBridgeRecovery] = useState<BridgeRecoveryView>({ phase: "idle", message: "" });
   const [coreRoot, setCoreRoot] = useState(() => storedValue(STORAGE_CORE_ROOT, ""));
   const [coreRootInput, setCoreRootInput] = useState(() => storedValue(STORAGE_CORE_ROOT, ""));
   const [coreRootError, setCoreRootError] = useState("");
@@ -3210,15 +3932,28 @@ export function App() {
   const [settingsSearch, setSettingsSearch] = useState("");
   const [modelSettingPicker, setModelSettingPicker] = useState<ModelSettingPicker>(null);
   const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [, setInspectorMode] = useState<"overview" | "review">("overview");
+  const [workspaceView, setWorkspaceView] = useState<"conversation" | "review">("conversation");
+  const [reviewSelectedPath, setReviewSelectedPath] = useState("");
+  const [reviewDecisionBusy, setReviewDecisionBusy] = useState(false);
+  const [reviewUndoBusy, setReviewUndoBusy] = useState(false);
   const [error, setError] = useState("");
   const lastGlobalId = useRef(0);
   const eventKeysRef = useRef<Set<string>>(new Set());
   const refreshEffectKey = useRef("");
+  const workspaceContextRequestRef = useRef(0);
   const streamReconnectAttempts = useRef(0);
+  const bridgeRecoveryPromiseRef = useRef<Promise<boolean> | null>(null);
+  const bridgeRecoveryLastAttemptAtRef = useRef(0);
+  const bridgeRecoveryHideTimerRef = useRef<number | null>(null);
+  const recoverManagedBridgeRef = useRef<(force?: boolean) => Promise<boolean>>(async () => false);
   const managedBridgeAutoSyncKey = useRef("");
+  const managedBridgeWorkspaceSyncRef = useRef<{
+    target: string;
+    promise: Promise<boolean>;
+  } | null>(null);
   const activeSessionIdRef = useRef(activeSessionId);
   const sessionViewEpochRef = useRef(0);
+  const reviewSelectedPathRef = useRef("");
   const sessionRenameCancelledRef = useRef(false);
   const composerComposingRef = useRef(false);
   const composerCompositionEndAtRef = useRef(0);
@@ -3228,6 +3963,7 @@ export function App() {
   const streamingDraftAnchoredTurnRef = useRef("");
   const timelineAutoScrollFrameRef = useRef<number | null>(null);
   const composerDockRef = useRef<HTMLDivElement | null>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const clearSessionListErrors = useCallback(() => {
     setSessionRenameError("");
@@ -3256,26 +3992,6 @@ export function App() {
   const bridgeSwitchInProgress =
     isTauriRuntime() && (managedBridgeBusyAny || managedBridgeWorkspaceMismatch || managedBridgeCoreMismatch);
   const bridgeApiReady = desktopAuthReady && (!isTauriRuntime() || Boolean(managedBridge?.running));
-
-  const loadProviderConfig = useCallback(async () => {
-    if (!isTauriRuntime()) return;
-    try {
-      const payload = await invoke<ProviderConfigPayload>("provider_config_read", {
-        options: { workspace: selectedProjectPath || undefined, coreRoot: selectedCoreRoot || undefined },
-      });
-      setProviderConfig(payload);
-      setProviderDraft(providerDraftFromPayload(payload));
-      setModel((current) => (isSelectableTextModel(current) ? current : providerDraftFromPayload(payload).model));
-      setProviderConfigError("");
-      setProviderValidation(null);
-    } catch (err) {
-      setProviderConfigError(userFacingErrorMessage(err));
-    }
-  }, [selectedCoreRoot, selectedProjectPath]);
-
-  useEffect(() => {
-    loadProviderConfig().catch((err: unknown) => setProviderConfigError(userFacingErrorMessage(err)));
-  }, [loadProviderConfig]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -3362,6 +4078,137 @@ export function App() {
     [bridgeUrl, token],
   );
 
+  const loadProviderConfig = useCallback(async () => {
+    if (!bridgeApiReady) return;
+    try {
+      const payload = await api<ProviderPayload>("/api/providers?check=true");
+      const config = payload.config;
+      setProvider(payload);
+      setProviderConfig(config ?? null);
+      setProviderDraft(providerDraftFromPayload(config));
+      setModel((current) => (isSelectableTextModel(current) ? current : providerDraftFromPayload(config).model));
+      setProviderConfigError("");
+    } catch (err) {
+      setProviderConfigError(userFacingErrorMessage(err));
+    }
+  }, [api, bridgeApiReady]);
+
+  useEffect(() => {
+    loadProviderConfig().catch((err: unknown) => setProviderConfigError(userFacingErrorMessage(err)));
+  }, [loadProviderConfig]);
+
+  const refreshCapabilities = useCallback(async () => {
+    if (!bridgeApiReady) return null;
+    try {
+      const payload = await api<CapabilitiesPayload>("/api/capabilities");
+      setCapabilities(payload);
+      setCapabilityError("");
+      return payload;
+    } catch (err) {
+      setCapabilityError(userFacingErrorMessage(err));
+      return null;
+    }
+  }, [api, bridgeApiReady]);
+
+  useEffect(() => {
+    refreshCapabilities().catch(() => {});
+  }, [refreshCapabilities]);
+
+  const refreshPerformance = useCallback(async () => {
+    if (!bridgeApiReady) return null;
+    const sessionId = activeSessionIdRef.current.trim();
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    try {
+      const payload = await api<PerformanceStatusPayload>(`/api/performance${query}`);
+      setPerformanceProbe(payload.latest ?? null);
+      setPerformanceError("");
+      return payload.latest ?? null;
+    } catch (err) {
+      setPerformanceError(userFacingErrorMessage(err));
+      return null;
+    }
+  }, [api, bridgeApiReady]);
+
+  const runPerformanceProbe = useCallback(async () => {
+    if (!bridgeApiReady || performanceBusy) return null;
+    const sessionId = activeSessionIdRef.current.trim();
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    setPerformanceBusy(true);
+    setPerformanceError("");
+    try {
+      const payload = await api<PerformanceProbe>(`/api/performance/probe${query}`, { method: "POST" });
+      setPerformanceProbe(payload);
+      return payload;
+    } catch (err) {
+      setPerformanceError(userFacingErrorMessage(err));
+      return null;
+    } finally {
+      setPerformanceBusy(false);
+    }
+  }, [api, bridgeApiReady, performanceBusy]);
+
+  useEffect(() => {
+    if (!settingsOpen || settingsPage !== "performance") return;
+    refreshPerformance().catch(() => {});
+  }, [refreshPerformance, settingsOpen, settingsPage]);
+
+  const refreshStorage = useCallback(async (audit = false) => {
+    if (!bridgeApiReady) return null;
+    setStorageBusy(audit ? "audit" : "refresh");
+    setStorageError("");
+    try {
+      const payload = await api<StorageStatusPayload>(audit ? "/api/storage/audit" : "/api/storage", audit ? { method: "POST" } : undefined);
+      setStorageStatus(payload);
+      return payload;
+    } catch (err) {
+      setStorageError(userFacingErrorMessage(err));
+      return null;
+    } finally {
+      setStorageBusy("");
+    }
+  }, [api, bridgeApiReady]);
+
+  const migrateStorage = useCallback(async () => {
+    if (!bridgeApiReady || storageBusy) return null;
+    setStorageBusy("migrate");
+    setStorageError("");
+    try {
+      const payload = await api<StorageStatusPayload>("/api/storage/migrate", { method: "POST" });
+      setStorageStatus(payload);
+      return payload;
+    } catch (err) {
+      setStorageError(userFacingErrorMessage(err));
+      return null;
+    } finally {
+      setStorageBusy("");
+    }
+  }, [api, bridgeApiReady, storageBusy]);
+
+  const rollbackStorage = useCallback(async () => {
+    if (!bridgeApiReady || storageBusy) return null;
+    const migrationId = storageStatus?.rollback_candidate?.migration_id;
+    setStorageBusy("rollback");
+    setStorageError("");
+    try {
+      const payload = await api<StorageStatusPayload>("/api/storage/rollback", {
+        method: "POST",
+        body: JSON.stringify(migrationId ? { migration_id: migrationId } : {}),
+      });
+      setStorageStatus(payload);
+      return payload;
+    } catch (err) {
+      setStorageError(userFacingErrorMessage(err));
+      return null;
+    } finally {
+      setStorageBusy("");
+    }
+  }, [api, bridgeApiReady, storageBusy, storageStatus?.rollback_candidate?.migration_id]);
+
+  useEffect(() => {
+    if (!settingsOpen || settingsPage !== "storage") return;
+    refreshStorage().catch(() => {});
+  }, [refreshStorage, settingsOpen, settingsPage]);
+
   const refreshMcp = useCallback(async () => {
     setMcpRefreshing(true);
     try {
@@ -3388,6 +4235,40 @@ export function App() {
       setMcpRefreshing(false);
     }
   }, [api]);
+
+  useEffect(() => {
+    if (!mcpOAuthPollingServer) return;
+    let active = true;
+    const poll = async () => {
+      if (!active) return;
+      if (Date.now() - mcpOAuthPollingStartedAtRef.current > 10 * 60 * 1000) {
+        setMcpOAuthPollingServer("");
+        setMcpMutationError("OAuth login timed out. Start Connect again.");
+        return;
+      }
+      try {
+        const payload = await api<McpPayload>("/api/mcp");
+        if (!active) return;
+        setMcp(payload);
+        const server = (payload.servers ?? []).find((item) => item.name === mcpOAuthPollingServer);
+        const status = server?.oauth?.status ?? "disconnected";
+        if (["connected", "error", "expired", "stale"].includes(status)) {
+          setMcpOAuthPollingServer("");
+          if (server?.oauth?.last_error) setMcpMutationError(server.oauth.last_error);
+        }
+      } catch {
+        // The regular Bridge connection state owns transient polling errors.
+      }
+    };
+    poll().catch(() => {});
+    const timer = window.setInterval(() => {
+      poll().catch(() => {});
+    }, 1500);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [api, mcpOAuthPollingServer]);
 
   const commitMcpMutation = useCallback(
     async (busyKey: string, path: string, init: RequestInit) => {
@@ -3572,6 +4453,137 @@ export function App() {
     [commitMcpMutation],
   );
 
+  const controlMcpOAuth = useCallback(
+    async (server: McpServerSummary, action: "login" | "refresh" | "revoke") => {
+      const name = server.name?.trim();
+      if (!name || server.type === "local") return;
+      const payload = await commitMcpMutation(
+        `oauth:${action}:${name}`,
+        `/api/mcp/servers/${encodeURIComponent(name)}/oauth/${action}`,
+        { method: "POST", body: action === "login" ? "{}" : undefined },
+      );
+      if (!payload) return;
+      if (action === "revoke") {
+        setMcpOAuthPollingServer("");
+        return;
+      }
+      if (action !== "login") return;
+      const authorizationUrl = payload.oauth_login?.authorization_url?.trim();
+      if (!authorizationUrl) {
+        setMcpMutationError("OAuth authorization URL was not returned by the Bridge.");
+        return;
+      }
+      try {
+        await invoke("open_external_url", { url: authorizationUrl });
+      } catch {
+        const opened = window.open(authorizationUrl, "_blank");
+        if (!opened) {
+          setMcpMutationError("Could not open the OAuth login page. Allow popups and try again.");
+          return;
+        }
+        opened.opener = null;
+      }
+      mcpOAuthPollingStartedAtRef.current = Date.now();
+      setMcpOAuthPollingServer(name);
+    },
+    [commitMcpMutation],
+  );
+
+  const refreshPlugins = useCallback(async () => {
+    try {
+      const payload = await api<PluginsPayload>("/api/plugins");
+      setPlugins(payload);
+      setPluginMutationError("");
+      return payload;
+    } catch (err) {
+      const message = userFacingErrorMessage(err);
+      setPluginMutationError(message);
+      throw err;
+    }
+  }, [api]);
+
+  const commitPluginMutation = useCallback(
+    async (busyKey: string, path: string, init: RequestInit) => {
+      setPluginMutationBusy(busyKey);
+      setPluginMutationError("");
+      try {
+        const payload = await api<PluginsPayload>(path, init);
+        setPlugins(payload);
+        return payload;
+      } catch (err) {
+        setPluginMutationError(userFacingErrorMessage(err));
+        return null;
+      } finally {
+        setPluginMutationBusy("");
+      }
+    },
+    [api],
+  );
+
+  const installPlugin = useCallback(
+    async (event: FormEvent) => {
+      event.preventDefault();
+      const source = pluginSourceDraft.trim();
+      if (!source) {
+        setPluginMutationError("请输入本地插件目录、SKILL.md 或 HTTPS Git 地址。");
+        return;
+      }
+      const payload = await commitPluginMutation("install", "/api/plugins", {
+        method: "POST",
+        body: JSON.stringify({ source, enabled: true }),
+      });
+      if (payload) setPluginSourceDraft("");
+    },
+    [commitPluginMutation, pluginSourceDraft],
+  );
+
+  const togglePlugin = useCallback(
+    async (plugin: PluginSummary) => {
+      const id = plugin.id?.trim();
+      if (!id) return;
+      await commitPluginMutation(`toggle:${id}`, `/api/plugins/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !plugin.enabled }),
+      });
+    },
+    [commitPluginMutation],
+  );
+
+  const updatePlugin = useCallback(
+    async (plugin: PluginSummary) => {
+      const id = plugin.id?.trim();
+      if (!id) return;
+      await commitPluginMutation(`update:${id}`, `/api/plugins/${encodeURIComponent(id)}/update`, {
+        method: "POST",
+      });
+    },
+    [commitPluginMutation],
+  );
+
+  const deletePlugin = useCallback(
+    async (plugin: PluginSummary) => {
+      const id = plugin.id?.trim();
+      if (!id) return;
+      const payload = await commitPluginMutation(`delete:${id}`, `/api/plugins/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      if (payload && pluginExpandedId === id) setPluginExpandedId("");
+    },
+    [commitPluginMutation, pluginExpandedId],
+  );
+
+  const toggleManagedSkill = useCallback(
+    async (skill: ManagedSkillSummary) => {
+      const name = skill.name?.trim();
+      if (!name) return;
+      await commitPluginMutation(`skill:${name}`, `/api/skills/${encodeURIComponent(name)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !skill.enabled }),
+      });
+    },
+    [commitPluginMutation],
+  );
+
   const addEvents = useCallback((incoming: AppEvent[]): AppEvent[] => {
     if (!incoming.length) return [];
     lastGlobalId.current = incoming.reduce((cursor, event) => {
@@ -3599,23 +4611,50 @@ export function App() {
 
   const refreshWorkspaceContext = useCallback(
     async (focusPath = "", expectedEpoch?: number) => {
+      const requestId = ++workspaceContextRequestRef.current;
       const normalizedPath = focusPath.trim();
-      const previewPath = normalizedPath ? `?path=${encodeURIComponent(normalizedPath)}&content=true` : "?depth=2";
-      const [treePayload, previewPayload, gitPayload] = await Promise.all([
-        api<FilesPayload>("/api/files?depth=2"),
-        api<FilesPayload>(`/api/files${previewPath}`),
-        api<GitPayload>("/api/git"),
+      const scopedSessionId = activeSessionIdRef.current.trim();
+      const treeParams = new URLSearchParams({ depth: "2" });
+      const previewParams = new URLSearchParams(normalizedPath ? { path: normalizedPath, content: "true" } : { depth: "2" });
+      const gitParams = new URLSearchParams(normalizedPath ? { path: normalizedPath } : {});
+      if (scopedSessionId) {
+        treeParams.set("session_id", scopedSessionId);
+        previewParams.set("session_id", scopedSessionId);
+        gitParams.set("session_id", scopedSessionId);
+      }
+      const [treePayload, previewPayload, gitPayload, workflowPayload] = await Promise.all([
+        api<FilesPayload>(`/api/files?${treeParams.toString()}`),
+        api<FilesPayload>(`/api/files?${previewParams.toString()}`),
+        api<GitPayload>(`/api/git${gitParams.size ? `?${gitParams.toString()}` : ""}`),
+        scopedSessionId
+          ? api<GitWorkflowPayload>(`/api/git/workflow?session_id=${encodeURIComponent(scopedSessionId)}`)
+          : Promise.resolve(null),
       ]);
-      if (expectedEpoch !== undefined && sessionViewEpochRef.current !== expectedEpoch) return;
+      if (
+        requestId !== workspaceContextRequestRef.current ||
+        (expectedEpoch !== undefined && sessionViewEpochRef.current !== expectedEpoch)
+      ) return;
       setFileTree(treePayload);
       setFilePreview(previewPayload);
       setGitStatus(gitPayload);
+      setGitWorkflow(workflowPayload);
     },
     [api],
   );
 
   const resetSessionView = useCallback(() => {
+    setWorkspaceView("conversation");
+    setReviewSelectedPath("");
+    reviewSelectedPathRef.current = "";
+    setReviewDecisionBusy(false);
+    setReviewUndoBusy(false);
     setSelectedTurnJobId("");
+    setSessionTaskTree({ tree: [], flat_tasks: [], count: 0 });
+    setSelectedSessionTaskId("");
+    setTaskTreeBusy(false);
+    setTaskTreeError("");
+    setTaskActionBusy("");
+    setTaskActionNotice("");
     setSessionMessages(null);
     setSessionDiff(null);
     setContextDiagnostics(null);
@@ -3623,6 +4662,12 @@ export function App() {
     setContextReplayError("");
     setCheckpoints(null);
     setRestoredCheckpointId("");
+    setFileTree(null);
+    setFilePreview(null);
+    setGitStatus(null);
+    setGitWorkflow(null);
+    setGitWorkflowBusy("");
+    setGitWorkflowError("");
     setEvents([]);
     setActiveTurnId("");
     setInterruptingTurnId("");
@@ -3630,6 +4675,23 @@ export function App() {
     setComposerAttachments([]);
     setAttachmentMenuOpen(false);
     setAttachmentError("");
+    setDurableGoal(null);
+    setGoalPanelOpen(false);
+    setGoalCreatingNew(false);
+    setGoalDraft(EMPTY_GOAL_DRAFT);
+    setGoalBusy("");
+    setGoalError("");
+    setDurablePlan(null);
+    setPlanPanelOpen(false);
+    setPlanCreatingNew(false);
+    setPlanDraft(EMPTY_PLAN_DRAFT);
+    setPlanBusy("");
+    setPlanError("");
+    setTerminalSession(null);
+    setTerminalChunks([]);
+    terminalCursorRef.current = 0;
+    setTerminalError("");
+    setTerminalBusy("");
   }, []);
 
   const activateSession = useCallback(
@@ -3670,6 +4732,11 @@ export function App() {
         setSessionMessages({ ...payload, session_id: payload.session_id || session });
       } catch (err) {
         if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        if (isUnsupportedEndpointError(err)) {
+          setDurableGoal(null);
+          setGoalError("");
+          return;
+        }
         if (isMissingSessionError(err)) {
           clearMissingSession(session);
           return;
@@ -3678,6 +4745,144 @@ export function App() {
       }
     },
     [api, clearMissingSession],
+  );
+
+  const refreshSessionGoal = useCallback(
+    async (session: string, expectedEpoch = sessionViewEpochRef.current) => {
+      if (!session) {
+        if (activeSessionIdRef.current === "" && sessionViewEpochRef.current === expectedEpoch) {
+          setDurableGoal(null);
+        }
+        return;
+      }
+      try {
+        const payload = await api<SessionGoalPayload>(`/api/sessions/${encodeURIComponent(session)}/goal`);
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        setDurableGoal(payload.goal ?? null);
+        setGoalError("");
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        if (isUnsupportedEndpointError(err)) {
+          setDurablePlan(null);
+          setPlanError("");
+          return;
+        }
+        if (isMissingSessionError(err)) {
+          clearMissingSession(session);
+          return;
+        }
+        setGoalError(userFacingErrorMessage(err));
+      }
+    },
+    [api, clearMissingSession],
+  );
+
+  const refreshSessionPlan = useCallback(
+    async (session: string, expectedEpoch = sessionViewEpochRef.current) => {
+      if (!session) {
+        if (activeSessionIdRef.current === "" && sessionViewEpochRef.current === expectedEpoch) {
+          setDurablePlan(null);
+        }
+        return;
+      }
+      try {
+        const payload = await api<SessionPlanPayload>(`/api/sessions/${encodeURIComponent(session)}/plan`);
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        setDurablePlan(payload.plan ?? null);
+        setPlanError("");
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        if (isUnsupportedEndpointError(err)) {
+          setSessionTaskTree({ tree: [], flat_tasks: [], count: 0 });
+          setSelectedSessionTaskId("");
+          setTaskTreeError("");
+          return;
+        }
+        if (isMissingSessionError(err)) {
+          clearMissingSession(session);
+          return;
+        }
+        setPlanError(userFacingErrorMessage(err));
+      }
+    },
+    [api, clearMissingSession],
+  );
+
+  const refreshSessionTaskTree = useCallback(
+    async (session: string, expectedEpoch = sessionViewEpochRef.current) => {
+      if (!session) {
+        if (activeSessionIdRef.current === "" && sessionViewEpochRef.current === expectedEpoch) {
+          setSessionTaskTree({ tree: [], flat_tasks: [], count: 0 });
+          setSelectedSessionTaskId("");
+        }
+        return;
+      }
+      setTaskTreeBusy(true);
+      try {
+        const payload = await api<SessionTaskTreePayload>(`/api/sessions/${encodeURIComponent(session)}/tasks`);
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        const flat = payload.flat_tasks ?? flatTaskTree(payload.tree);
+        setSessionTaskTree({ ...payload, count: payload.count ?? flat.length, flat_tasks: flat });
+        setSelectedSessionTaskId((current) =>
+          current && flat.some((task) => taskNodeId(task) === current) ? current : taskNodeId(flat[0]),
+        );
+        setTaskTreeError("");
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        if (isMissingSessionError(err)) {
+          clearMissingSession(session);
+          return;
+        }
+        setTaskTreeError(userFacingErrorMessage(err));
+      } finally {
+        if (activeSessionIdRef.current === session && sessionViewEpochRef.current === expectedEpoch) {
+          setTaskTreeBusy(false);
+        }
+      }
+    },
+    [api, clearMissingSession],
+  );
+
+  const runTaskLifecycleAction = useCallback(
+    async (action: TaskLifecycleAction, task: SessionTaskNode) => {
+      const session = activeSessionIdRef.current;
+      const expectedEpoch = sessionViewEpochRef.current;
+      const taskId = taskNodeId(task);
+      if (!session || !taskId) return;
+      const taskParentSessionId = task.parent_session_id || session;
+      const actionKey = `${taskId}:${action}`;
+      setTaskActionBusy(actionKey);
+      setTaskActionNotice("");
+      setTaskTreeError("");
+      try {
+        const payload = await api<{ status?: string; timed_out?: boolean }>(
+          `/api/sessions/${encodeURIComponent(taskParentSessionId)}/tasks/${encodeURIComponent(taskId)}/${action}`,
+          {
+            method: "POST",
+            body: JSON.stringify(action === "wait" ? { timeout_ms: 5_000 } : {}),
+          },
+        );
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        const notices: Record<TaskLifecycleAction, string> = {
+          start: "后台任务已启动。",
+          wait: payload.timed_out ? "任务仍在执行，状态会继续更新。" : "任务已结束。",
+          promote: "任务已提升到前台执行。",
+          cancel: payload.status === "cancel_requested" ? "正在安全取消任务。" : "任务已取消。",
+          resume: "任务已恢复并重新排队。",
+        };
+        setTaskActionNotice(notices[action]);
+        await refreshSessionTaskTree(session, expectedEpoch);
+        setSelectedSessionTaskId(taskId);
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        setTaskTreeError(userFacingErrorMessage(err));
+      } finally {
+        if (activeSessionIdRef.current === session && sessionViewEpochRef.current === expectedEpoch) {
+          setTaskActionBusy("");
+        }
+      }
+    },
+    [api, refreshSessionTaskTree],
   );
 
   const refreshInteractions = useCallback(
@@ -3730,7 +4935,10 @@ export function App() {
         setSessionDiff(diffPayload);
         setContextDiagnostics({ ...contextPayload, session_id: contextPayload.session_id || session });
         setCheckpoints(checkpointsPayload);
-        await refreshWorkspaceContext(stringField(diffPayload.latest ?? undefined, "path"), expectedEpoch);
+        await refreshWorkspaceContext(
+          reviewSelectedPathRef.current || stringField(diffPayload.latest ?? undefined, "path"),
+          expectedEpoch,
+        );
       } catch (err) {
         if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
         if (isMissingSessionError(err)) {
@@ -3779,7 +4987,7 @@ export function App() {
     const expectedEpoch = sessionViewEpochRef.current;
     setError("");
     clearSessionListErrors();
-    const [protocolPayload, providerPayload, mcpPayload, sessionsPayload, approvalsPayload, questionsPayload, turnJobsPayload] = await Promise.all([
+    const [protocolPayload, providerPayload, mcpPayload, pluginsPayload, capabilitiesPayload, sessionsPayload, approvalsPayload, questionsPayload, turnJobsPayload] = await Promise.all([
       api<ProtocolPayload>("/api/protocol"),
       api<ProviderPayload>("/api/models?check=true").catch((err: unknown) => ({
         healthy: false,
@@ -3799,6 +5007,15 @@ export function App() {
         error: userFacingErrorMessage(err),
         servers: [],
       })),
+      api<PluginsPayload>("/api/plugins").catch(() => ({
+        plugins: [],
+        plugin_count: 0,
+        enabled_plugin_count: 0,
+        skills: [],
+        skill_count: 0,
+        issues: [],
+      })),
+      api<CapabilitiesPayload>("/api/capabilities").catch(() => ({ capabilities: [] })),
       api<{ sessions?: SessionSummary[] }>("/api/sessions"),
       api<{ approvals?: PendingApproval[] }>("/api/approvals"),
       api<{ questions?: PendingQuestion[] }>("/api/questions"),
@@ -3815,6 +5032,8 @@ export function App() {
     setProtocol(protocolPayload);
     setProvider(providerPayload);
     setMcp(mcpPayload);
+    setPlugins(pluginsPayload);
+    setCapabilities(capabilitiesPayload);
     setTurnJobs(normalizeTurnJobs(turnJobsPayload));
     setApprovals(approvalsPayload.approvals ?? []);
     setQuestions(questionsPayload.questions ?? []);
@@ -3858,11 +5077,150 @@ export function App() {
       }),
     });
     const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
+    if (!id) throw new Error("Bridge did not return a persisted session id.");
     const session = createdSessionSummary(payload, workspace ?? selectedProjectPath);
     if (session) setSessions((current) => upsertSessionSummary(current, session));
     activateSession(id, workspace ?? selectedProjectPath);
     return id;
   }, [activateSession, api, bridgeSwitchInProgress, clearSessionListErrors, selectedProjectPath]);
+
+  const openGoalPanel = useCallback(async () => {
+    let session = activeSessionIdRef.current;
+    if (!session) session = await createSession();
+    if (activeSessionIdRef.current !== session) return;
+    const goal = durableGoal;
+    setGoalCreatingNew(false);
+    setGoalDraft(
+      goal
+        ? {
+            title: goal.title,
+            objective: goal.objective,
+            acceptanceCriteria: (goal.acceptance_criteria ?? []).join("\n"),
+          }
+        : EMPTY_GOAL_DRAFT,
+    );
+    setGoalError("");
+    setGoalPanelOpen(true);
+    setPlanPanelOpen(false);
+    setAttachmentMenuOpen(false);
+  }, [createSession, durableGoal]);
+
+  const mutateDurableGoal = useCallback(
+    async (action: "create" | "update" | "pause" | "resume" | "complete") => {
+      let session = activeSessionIdRef.current;
+      if (!session) session = await createSession();
+      const expectedEpoch = sessionViewEpochRef.current;
+      setGoalBusy(action);
+      setGoalError("");
+      try {
+        const payload = await api<SessionGoalPayload>(`/api/sessions/${encodeURIComponent(session)}/goal`, {
+          method: "PUT",
+          body: JSON.stringify({
+            action,
+            ...(action === "create" || action === "update"
+              ? {
+                  title: goalDraft.title,
+                  objective: goalDraft.objective,
+                  acceptance_criteria: goalDraft.acceptanceCriteria
+                    .split("\n")
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                }
+              : {}),
+          }),
+        });
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        const goal = payload.goal ?? null;
+        setDurableGoal(goal);
+        setGoalCreatingNew(false);
+        if (goal) {
+          setGoalDraft({
+            title: goal.title,
+            objective: goal.objective,
+            acceptanceCriteria: (goal.acceptance_criteria ?? []).join("\n"),
+          });
+        }
+        if (action === "create" || action === "update") setGoalPanelOpen(false);
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        setGoalError(userFacingErrorMessage(err));
+      } finally {
+        if (activeSessionIdRef.current === session && sessionViewEpochRef.current === expectedEpoch) {
+          setGoalBusy("");
+        }
+      }
+    },
+    [api, createSession, goalDraft],
+  );
+
+  const openPlanPanel = useCallback(async () => {
+    let session = activeSessionIdRef.current;
+    if (!session) session = await createSession();
+    if (activeSessionIdRef.current !== session) return;
+    const plan = durablePlan;
+    setPlanCreatingNew(false);
+    setPlanDraft(
+      plan
+        ? {
+            title: plan.title,
+            objective: plan.objective,
+            steps: (plan.steps ?? []).join("\n"),
+          }
+        : EMPTY_PLAN_DRAFT,
+    );
+    setPlanError("");
+    setPlanPanelOpen(true);
+    setGoalPanelOpen(false);
+    setAttachmentMenuOpen(false);
+  }, [createSession, durablePlan]);
+
+  const mutateDurablePlan = useCallback(
+    async (action: "create" | "update" | "execute" | "complete") => {
+      let session = activeSessionIdRef.current;
+      if (!session) session = await createSession();
+      const expectedEpoch = sessionViewEpochRef.current;
+      setPlanBusy(action);
+      setPlanError("");
+      try {
+        const payload = await api<SessionPlanPayload>(`/api/sessions/${encodeURIComponent(session)}/plan`, {
+          method: "PUT",
+          body: JSON.stringify({
+            action,
+            ...(action === "create" || action === "update"
+              ? {
+                  title: planDraft.title,
+                  objective: planDraft.objective,
+                  steps: planDraft.steps
+                    .split("\n")
+                    .map((item) => item.trim())
+                    .filter(Boolean),
+                }
+              : {}),
+          }),
+        });
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        const plan = payload.plan ?? null;
+        setDurablePlan(plan);
+        setPlanCreatingNew(false);
+        if (plan) {
+          setPlanDraft({
+            title: plan.title,
+            objective: plan.objective,
+            steps: (plan.steps ?? []).join("\n"),
+          });
+        }
+        if (action === "create" || action === "update") setPlanPanelOpen(false);
+      } catch (err) {
+        if (activeSessionIdRef.current !== session || sessionViewEpochRef.current !== expectedEpoch) return;
+        setPlanError(userFacingErrorMessage(err));
+      } finally {
+        if (activeSessionIdRef.current === session && sessionViewEpochRef.current === expectedEpoch) {
+          setPlanBusy("");
+        }
+      }
+    },
+    [api, createSession, planDraft],
+  );
 
 	  const beginRenameSession = useCallback((session: SessionSummary) => {
 	    const id = sessionId(session);
@@ -3938,7 +5296,11 @@ export function App() {
       clearSessionListErrors();
       const deletingActive = activeSessionIdRef.current === id;
       const deletingWorkspace = session.workspace || selectedProjectPath;
-      if (deletingActive) activateSession("", deletingWorkspace);
+      if (deletingActive) {
+        activateSession("", deletingWorkspace);
+        await nextPaint();
+        await sleepMs(120);
+      }
       try {
         await api(`/api/sessions/${encodeURIComponent(id)}`, {
           method: "DELETE",
@@ -4227,36 +5589,211 @@ export function App() {
     [activeSessionId, addEvents, api, refreshFromEvents, refreshSessionMessages, refreshSessionTrust],
   );
 
-  const runTerminalCommand = useCallback(
+  const readTerminalSession = useCallback(
+    async (terminalId: string, reset = false) => {
+      const after = reset ? 0 : terminalCursorRef.current;
+      const payload = await api<TerminalSessionPayload>(
+        `/api/terminal/sessions/${encodeURIComponent(terminalId)}?after=${after}`,
+      );
+      if (reset) setTerminalChunks(payload.chunks ?? []);
+      else if (payload.chunks?.length) {
+        setTerminalChunks((current) => {
+          const seen = new Set(current.map((chunk) => chunk.sequence));
+          return [...current, ...payload.chunks!.filter((chunk) => !seen.has(chunk.sequence))].slice(-500);
+        });
+      }
+      terminalCursorRef.current = payload.cursor ?? after;
+      setTerminalSession(payload);
+      return payload;
+    },
+    [api],
+  );
+
+  const refreshTerminalSession = useCallback(async () => {
+    if (!bridgeApiReady) return null;
+    const sessionId = activeSessionIdRef.current.trim();
+    const query = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : "";
+    try {
+      const payload = await api<TerminalSessionsPayload>(`/api/terminal/sessions${query}`);
+      const terminal = [...(payload.terminals ?? [])]
+        .sort((left, right) => (right.started_at_ms ?? 0) - (left.started_at_ms ?? 0))[0] ?? null;
+      terminalCursorRef.current = 0;
+      setTerminalChunks([]);
+      setTerminalSession(terminal);
+      if (terminal) await readTerminalSession(terminal.terminal_id, true);
+      setTerminalError("");
+      return terminal;
+    } catch (err) {
+      setTerminalError(userFacingErrorMessage(err));
+      return null;
+    }
+  }, [api, bridgeApiReady, readTerminalSession]);
+
+  const startTerminalSession = useCallback(async () => {
+    if (!bridgeApiReady || terminalBusy) return;
+    setTerminalBusy("start");
+    setTerminalError("");
+    try {
+      if (terminalSession?.terminal_id) {
+        await api(`/api/terminal/sessions/${encodeURIComponent(terminalSession.terminal_id)}`, {
+          method: "DELETE",
+        });
+      }
+      const payload = await api<TerminalSessionPayload>("/api/terminal/sessions", {
+        method: "POST",
+        body: JSON.stringify({ session_id: activeSessionIdRef.current || undefined }),
+      });
+      terminalCursorRef.current = 0;
+      setTerminalChunks([]);
+      setTerminalSession(payload);
+      await readTerminalSession(payload.terminal_id, true);
+    } catch (err) {
+      setTerminalError(userFacingErrorMessage(err));
+    } finally {
+      setTerminalBusy("");
+    }
+  }, [api, bridgeApiReady, readTerminalSession, terminalBusy, terminalSession?.terminal_id]);
+
+  const submitTerminalInput = useCallback(
     async (event: FormEvent) => {
       event.preventDefault();
-      const command = terminalCommand.trim();
-      if (!command) return;
-      setTerminalBusy(true);
+      if (!terminalSession?.terminal_id || !terminalInput || terminalBusy) return;
+      setTerminalBusy("input");
       setTerminalError("");
       try {
-        const payload = await api<TerminalRunResult>("/api/terminal/run", {
+        await api(`/api/terminal/sessions/${encodeURIComponent(terminalSession.terminal_id)}/input`, {
           method: "POST",
-          body: JSON.stringify({ command }),
+          body: JSON.stringify({ input: terminalInput }),
         });
-        setTerminalResult(payload);
+        setTerminalInput("");
+        window.setTimeout(() => readTerminalSession(terminalSession.terminal_id), 40);
       } catch (err) {
         setTerminalError(userFacingErrorMessage(err));
       } finally {
-        setTerminalBusy(false);
+        setTerminalBusy("");
       }
     },
-    [api, terminalCommand],
+    [api, readTerminalSession, terminalBusy, terminalInput, terminalSession?.terminal_id],
+  );
+
+  const interruptTerminalSession = useCallback(async () => {
+    if (!terminalSession?.terminal_id || terminalBusy) return;
+    setTerminalBusy("interrupt");
+    setTerminalError("");
+    try {
+      await api(`/api/terminal/sessions/${encodeURIComponent(terminalSession.terminal_id)}/interrupt`, {
+        method: "POST",
+      });
+      await readTerminalSession(terminalSession.terminal_id);
+    } catch (err) {
+      setTerminalError(userFacingErrorMessage(err));
+    } finally {
+      setTerminalBusy("");
+    }
+  }, [api, readTerminalSession, terminalBusy, terminalSession?.terminal_id]);
+
+  const closeTerminalSession = useCallback(async () => {
+    if (!terminalSession?.terminal_id || terminalBusy) return;
+    setTerminalBusy("close");
+    setTerminalError("");
+    try {
+      await api(`/api/terminal/sessions/${encodeURIComponent(terminalSession.terminal_id)}`, {
+        method: "DELETE",
+      });
+      terminalCursorRef.current = 0;
+      setTerminalChunks([]);
+      setTerminalSession(null);
+    } catch (err) {
+      setTerminalError(userFacingErrorMessage(err));
+    } finally {
+      setTerminalBusy("");
+    }
+  }, [api, terminalBusy, terminalSession?.terminal_id]);
+
+  useEffect(() => {
+    if (!settingsOpen || settingsPage !== "computer") return;
+    refreshTerminalSession().catch(() => {});
+  }, [activeSessionId, refreshTerminalSession, settingsOpen, settingsPage]);
+
+  useEffect(() => {
+    if (
+      !settingsOpen
+      || settingsPage !== "computer"
+      || !terminalSession?.terminal_id
+      || !terminalSession.running
+    ) return;
+    const terminalId = terminalSession.terminal_id;
+    const timer = window.setInterval(() => {
+      readTerminalSession(terminalId).catch((err: unknown) => {
+        setTerminalError(userFacingErrorMessage(err));
+      });
+    }, 350);
+    return () => window.clearInterval(timer);
+  }, [readTerminalSession, settingsOpen, settingsPage, terminalSession?.terminal_id, terminalSession?.running]);
+
+  const updateCapability = useCallback(
+    async (capability: CapabilitySummary, change: Partial<Pick<CapabilitySummary, "enabled" | "policy">>) => {
+      const id = capability.id;
+      setCapabilityBusy(`update:${id}`);
+      setCapabilityError("");
+      try {
+        if (
+          id === "terminal"
+          && (change.enabled === false || change.policy !== "allow")
+          && terminalSession?.terminal_id
+        ) {
+          await api(`/api/terminal/sessions/${encodeURIComponent(terminalSession.terminal_id)}`, {
+            method: "DELETE",
+          }).catch(() => {});
+        }
+        const payload = await api<CapabilitiesPayload>(`/api/capabilities/${id}`, {
+          method: "PUT",
+          body: JSON.stringify(change),
+        });
+        setCapabilities(payload);
+        if (id === "terminal" && (change.enabled === false || change.policy !== "allow")) {
+          setTerminalSession(null);
+          setTerminalChunks([]);
+          terminalCursorRef.current = 0;
+        }
+      } catch (err) {
+        setCapabilityError(userFacingErrorMessage(err));
+      } finally {
+        setCapabilityBusy("");
+      }
+    },
+    [api, terminalSession?.terminal_id],
+  );
+
+  const diagnoseCapability = useCallback(
+    async (capability: CapabilitySummary) => {
+      const id = capability.id;
+      setCapabilityBusy(`diagnose:${id}`);
+      setCapabilityError("");
+      try {
+        const payload = await api<CapabilityDiagnosticResult>(`/api/capabilities/${id}/diagnose`, {
+          method: "POST",
+        });
+        if (payload.state) setCapabilities(payload.state);
+      } catch (err) {
+        setCapabilityError(userFacingErrorMessage(err));
+      } finally {
+        setCapabilityBusy("");
+      }
+    },
+    [api],
   );
 
   const attachOpenAgentContext = useCallback(async () => {
     setAttachmentMenuOpen(false);
     setAttachmentError("");
     const activeSession = sessions.find((session) => sessionId(session) === activeSessionId);
+    const sessionScope = activeSessionId ? `&session_id=${encodeURIComponent(activeSessionId)}` : "";
+    const gitScope = activeSessionId ? `?session_id=${encodeURIComponent(activeSessionId)}` : "";
     try {
       const [freshFileTree, freshGitStatus, freshSessionDiff, freshMcp] = await Promise.all([
-        api<FilesPayload>("/api/files?depth=2").catch(() => null),
-        api<GitPayload>("/api/git").catch(() => null),
+        api<FilesPayload>(`/api/files?depth=2${sessionScope}`).catch(() => null),
+        api<GitPayload>(`/api/git${gitScope}`).catch(() => null),
         activeSessionId ? api<SessionDiff>(`/api/sessions/${activeSessionId}/diff`).catch(() => null) : Promise.resolve(null),
         api<McpPayload>("/api/mcp?refresh=true").catch(() => null),
       ]);
@@ -4552,6 +6089,39 @@ export function App() {
 
   useEffect(() => {
     if (!bridgeApiReady) return;
+    refreshSessionGoal(activeSessionId).catch((err: unknown) => {
+      if (!isInitialBridgeFetchError(err)) setGoalError(userFacingErrorMessage(err));
+    });
+  }, [activeSessionId, bridgeApiReady, refreshSessionGoal]);
+
+  useEffect(() => {
+    if (!bridgeApiReady) return;
+    refreshSessionPlan(activeSessionId).catch((err: unknown) => {
+      if (!isInitialBridgeFetchError(err)) setPlanError(userFacingErrorMessage(err));
+    });
+  }, [activeSessionId, bridgeApiReady, refreshSessionPlan]);
+
+  useEffect(() => {
+    if (!bridgeApiReady) return;
+    refreshSessionTaskTree(activeSessionId).catch((err: unknown) => {
+      if (!isInitialBridgeFetchError(err)) setTaskTreeError(userFacingErrorMessage(err));
+    });
+  }, [activeSessionId, bridgeApiReady, refreshSessionTaskTree, streamState]);
+
+  useEffect(() => {
+    if (!bridgeApiReady || !activeSessionId) return;
+    const hasActiveTasks = (sessionTaskTree.flat_tasks ?? []).some((task) =>
+      ["queued", "running", "waiting"].includes(taskStatus(task)),
+    );
+    if (!hasActiveTasks) return;
+    const interval = window.setInterval(() => {
+      refreshSessionTaskTree(activeSessionId).catch(() => undefined);
+    }, 2_000);
+    return () => window.clearInterval(interval);
+  }, [activeSessionId, bridgeApiReady, refreshSessionTaskTree, sessionTaskTree.flat_tasks]);
+
+  useEffect(() => {
+    if (!bridgeApiReady) return;
     refreshSessionTrust(activeSessionId).catch((err: unknown) => {
       if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
     });
@@ -4577,12 +6147,18 @@ export function App() {
       while (!cancelled) {
         controller = new AbortController();
         const resumeCursor = lastGlobalId.current;
-        setStreamHealth((current) => ({
-          ...current,
-          status: streamReconnectAttempts.current > 0 ? "reconnecting" : "polling",
-          resume_cursor: resumeCursor,
-        }));
+        const reconnecting = streamReconnectAttempts.current > 0;
+        setStreamHealth((current) => {
+          const status = reconnecting ? "reconnecting" : current.status === "idle" ? "polling" : current.status;
+          if (current.status === status && current.resume_cursor === resumeCursor) return current;
+          return {
+            ...current,
+            status,
+            resume_cursor: resumeCursor,
+          };
+        });
         try {
+          const cycleStartedAt = performance.now();
           const headers = new Headers({ accept: "text/event-stream" });
           if (token.trim()) headers.set("authorization", `Bearer ${token.trim()}`);
           const response = await fetch(
@@ -4606,17 +6182,37 @@ export function App() {
           const recovered = streamReconnectAttempts.current > 0;
           streamReconnectAttempts.current = 0;
           setConnection("online");
-          setStreamHealth((current) => ({
-            ...current,
-            status: recovered ? "resumed" : "listening",
-            resume_cursor: lastGlobalId.current,
-            reconnect_attempts: 0,
-            recovered_count: current.recovered_count + (recovered ? 1 : 0),
-            last_batch_count: parsed.length,
-            last_error: undefined,
-            last_connected_at_ms: Date.now(),
-            next_retry_ms: undefined,
-          }));
+          setStreamHealth((current) => {
+            const status = recovered ? "resumed" : "listening";
+            if (
+              !recovered
+              && parsed.length === 0
+              && current.status === status
+              && current.resume_cursor === lastGlobalId.current
+              && current.reconnect_attempts === 0
+              && current.last_batch_count === 0
+              && !current.last_error
+              && current.next_retry_ms === undefined
+            ) {
+              return current;
+            }
+            return {
+              ...current,
+              status,
+              resume_cursor: lastGlobalId.current,
+              reconnect_attempts: 0,
+              recovered_count: current.recovered_count + (recovered ? 1 : 0),
+              last_batch_count: parsed.length,
+              last_error: undefined,
+              last_connected_at_ms: Date.now(),
+              next_retry_ms: undefined,
+            };
+          });
+          const emptyCycleDelay = emptySseReconnectDelayMs(
+            performance.now() - cycleStartedAt,
+            parsed.length,
+          );
+          if (emptyCycleDelay > 0 && !cancelled) await sleepMs(emptyCycleDelay);
         } catch (err) {
           if (!cancelled) {
             streamReconnectAttempts.current += 1;
@@ -4631,6 +6227,11 @@ export function App() {
               last_error: userFacingErrorMessage(err),
               next_retry_ms: retryMs,
             }));
+            if (isTauriRuntime() && attempts >= 2) {
+              const recovered = await recoverManagedBridgeRef.current();
+              if (cancelled) return;
+              if (recovered) continue;
+            }
             await new Promise((resolve) => window.setTimeout(resolve, retryMs));
           }
         }
@@ -4764,9 +6365,10 @@ export function App() {
   const trustHistory = useMemo(() => trustHistoryFromMessages(activeMessages), [activeMessages]);
   const modelOptions = useMemo(
     () =>
-      (provider?.models?.map((item) => item.id).filter(Boolean) as string[] | undefined)?.filter(
-        isSelectableTextModel,
-      ),
+      (provider?.models
+        ?.filter((item) => item.capabilities?.selectable !== false)
+        .map((item) => item.id)
+        .filter(Boolean) as string[] | undefined)?.filter(isSelectableTextModel),
     [provider?.models],
   );
   const providerDraftModelOptions = useMemo(() => {
@@ -4778,6 +6380,14 @@ export function App() {
   const prioritizedModelOptions = useMemo(
     () => sortModelsWithSolFirst(modelOptions?.length ? modelOptions : providerDraftModelOptions),
     [modelOptions, providerDraftModelOptions],
+  );
+  const providerCatalogModels = useMemo(
+    () =>
+      (provider?.models ?? []).filter((item) => {
+        const profile = item.profile || (item.id?.toLowerCase().startsWith("glm-") ? "glm" : "gpt");
+        return profile === providerDraft.profile;
+      }),
+    [provider?.models, providerDraft.profile],
   );
   const reasoningEffortLabel = REASONING_EFFORT_OPTIONS.find((item) => item.value === reasoningEffort)?.label ?? "极高";
   const responseSpeedOption = RESPONSE_SPEED_OPTIONS.find((item) => item.value === responseSpeed) ?? RESPONSE_SPEED_OPTIONS[0];
@@ -4798,6 +6408,15 @@ export function App() {
   const mcpWritable = Boolean(mcp?.writable);
   const mcpConfigPath = mcp?.config_path ?? "";
   const mcpEditing = Boolean(mcpEditingServerName);
+  const installedPlugins = plugins?.plugins ?? [];
+  const managedSkills = plugins?.skills ?? [];
+  const filteredManagedSkills = useMemo(() => {
+    const query = skillFilter.trim().toLowerCase();
+    if (!query) return managedSkills;
+    return managedSkills.filter((skill) =>
+      `${skill.name ?? ""} ${skill.description ?? ""} ${skill.plugin_id ?? ""}`.toLowerCase().includes(query),
+    );
+  }, [managedSkills, skillFilter]);
   const workspaceStyle = useMemo(
     () => ({ "--composer-dock-height": `${Math.ceil(composerDockHeight)}px` }) as CSSProperties,
     [composerDockHeight],
@@ -5007,7 +6626,7 @@ export function App() {
       title: "集成",
       items: [
         { id: "mcp", label: "MCP 服务器", icon: <Wrench size={15} />, keywords: "mcp servers tools lifecycle" },
-        { id: "computer", label: "电脑操控", icon: <Terminal size={15} />, keywords: "computer control terminal 电脑" },
+        { id: "computer", label: "能力与权限", icon: <ShieldCheck size={15} />, keywords: "browser computer terminal capability permission 浏览器 电脑 终端 权限" },
       ],
     },
     {
@@ -5016,6 +6635,8 @@ export function App() {
         { id: "connections", label: "连接", icon: <Radio size={15} />, keywords: "connection bridge auth url 连接" },
         { id: "git", label: "Git", icon: <GitBranch size={15} />, keywords: "git diff branch changes" },
         { id: "environment", label: "环境", icon: <Terminal size={15} />, keywords: "environment harness runtime terminal 环境" },
+        { id: "performance", label: "性能与稳定性", icon: <Activity size={15} />, keywords: "performance stability benchmark large repository session diff task attachment 性能 稳定性 基线" },
+        { id: "storage", label: "存储与升级", icon: <Database size={15} />, keywords: "storage migration upgrade rollback backup schema 存储 迁移 升级 回滚 备份" },
         { id: "worktree", label: "工作树", icon: <Folder size={15} />, keywords: "worktree workspace project 工作树" },
       ],
     },
@@ -5042,12 +6663,84 @@ export function App() {
   const latestPatchStatus =
     stringField(latestPatch, "status") ||
     (latestPatch ? `${sessionDiff?.undo_count ?? 0} undo · ${sessionDiff?.redo_count ?? 0} redo` : "");
+  const allReviewPatches = useMemo(
+    () => (sessionDiff?.patches ?? []).map(reviewPatchFromRecord).filter((patch): patch is ReviewPatch => Boolean(patch)),
+    [sessionDiff?.patches],
+  );
+  const reviewPatches = useMemo(() => {
+    const latestRunId = allReviewPatches[0]?.runId;
+    return latestRunId
+      ? allReviewPatches.filter((patch) => patch.runId === latestRunId)
+      : allReviewPatches;
+  }, [allReviewPatches]);
+  const selectedGitPatch = useMemo(
+    () => reviewPatchFromGit(gitStatus?.selected_diff),
+    [gitStatus?.selected_diff],
+  );
+  const reviewFiles = useMemo(() => {
+    const files = new Map<string, ReviewFile>();
+    for (const change of gitStatus?.changes ?? []) {
+      const path = change.path?.trim();
+      if (path) {
+        files.set(path, {
+          path,
+          status: change.status,
+          additions: change.additions,
+          deletions: change.deletions,
+          binary: change.binary,
+        });
+      }
+    }
+    for (const patch of reviewPatches) {
+      const current = files.get(patch.path);
+      const counts = changedLineCounts(patch.diff);
+      files.set(patch.path, {
+        ...current,
+        path: patch.path,
+        status: patch.status || current?.status,
+        additions: current?.additions ?? counts.additions,
+        deletions: current?.deletions ?? counts.deletions,
+      });
+    }
+    return [...files.values()];
+  }, [gitStatus?.changes, reviewPatches]);
+  const currentReviewPatch =
+    reviewPatches.find((patch) => patch.path === reviewSelectedPath) ??
+    (selectedGitPatch?.path === reviewSelectedPath ? selectedGitPatch : undefined);
+  const latestReviewPatch = reviewPatches[0];
+  const changeReviewDecision = changeReviewDecisionFromSession(activeSession);
+  const reviewDecisionStatus =
+    changeReviewDecision &&
+    (!latestReviewPatch?.id || !changeReviewDecision.patch_id || changeReviewDecision.patch_id === latestReviewPatch.id)
+      ? changeReviewDecision.status
+      : undefined;
+  const reviewTurnStartCheckpoint = useMemo(() => {
+    const records = checkpoints?.checkpoints ?? [];
+    const runId = currentReviewPatch?.runId || latestReviewPatch?.runId;
+    return (
+      records.find((checkpoint) => checkpoint.kind === "step_start" && (!runId || checkpoint.run_id === runId)) ??
+      records.find((checkpoint) => checkpoint.kind === "step_start")
+    );
+  }, [checkpoints?.checkpoints, currentReviewPatch?.runId, latestReviewPatch?.runId]);
+  const reviewRestoreCompleted = Boolean(
+    reviewTurnStartCheckpoint?.checkpoint_id && restoredCheckpointId === reviewTurnStartCheckpoint.checkpoint_id,
+  );
+  const pendingGitWorkflowApproval = approvals.find(
+    (item) =>
+      item.session_id === activeSessionId &&
+      stringField(item.approval, "source") === "git_workflow",
+  );
   const showWorkspaceDock =
     pendingInteractionCount > 0 ||
     Boolean(latestPatch);
   const showComposerContext = false;
+  const sessionTaskCount = sessionTaskTree.count ?? sessionTaskTree.flat_tasks?.length ?? flatTaskTree(sessionTaskTree.tree).length;
   const timelineEmpty =
-    activeMessages.length === 0 && visibleLiveEvents.length === 0 && !activeStreamingDraft && !liveFinalAnswer;
+    activeMessages.length === 0 &&
+    visibleLiveEvents.length === 0 &&
+    !activeStreamingDraft &&
+    !liveFinalAnswer &&
+    sessionTaskCount === 0;
   const latestUserActivity = useMemo(() => {
     for (const message of [...activeMessages].reverse()) {
       if (message.info?.role !== "user") continue;
@@ -5139,6 +6832,79 @@ export function App() {
     ],
   );
 
+  const recoverManagedBridge = useCallback(
+    async (force = false): Promise<boolean> => {
+      if (!isTauriRuntime()) return false;
+      if (bridgeRecoveryPromiseRef.current) return bridgeRecoveryPromiseRef.current;
+      const now = Date.now();
+      if (!force && now - bridgeRecoveryLastAttemptAtRef.current < 8_000) return false;
+      bridgeRecoveryLastAttemptAtRef.current = now;
+      if (bridgeRecoveryHideTimerRef.current !== null) {
+        window.clearTimeout(bridgeRecoveryHideTimerRef.current);
+        bridgeRecoveryHideTimerRef.current = null;
+      }
+
+      const recovery = (async () => {
+        setManagedBridgeBusy("recover");
+        setBridgeRecovery({
+          phase: "recovering",
+          message: "Bridge 意外断开，正在恢复当前工作区和会话…",
+        });
+        try {
+          const payload = await invoke<ManagedBridgeStatus>("bridge_recover", {
+            options: managedBridgeStartOptions(),
+            restartRunning: true,
+          });
+          setManagedBridge(payload);
+          setManagedBridgeError(payload.error ?? "");
+          if (!payload.running) throw new Error(payload.error || "Bridge recovery did not start the runtime");
+          if (payload.url) setBridgeUrl(payload.url);
+          await new Promise((resolve) => window.setTimeout(resolve, 180));
+          await refresh();
+          streamReconnectAttempts.current = 0;
+          setConnection("online");
+          setBridgeRecovery({
+            phase: "recovered",
+            message: "连接已恢复，当前工作区与会话保持不变。",
+          });
+          bridgeRecoveryHideTimerRef.current = window.setTimeout(() => {
+            setBridgeRecovery({ phase: "idle", message: "" });
+            bridgeRecoveryHideTimerRef.current = null;
+          }, 3_200);
+          return true;
+        } catch (err) {
+          const message = userFacingErrorMessage(err);
+          setManagedBridgeError(message);
+          setConnection("offline");
+          setBridgeRecovery({
+            phase: "failed",
+            message: "Bridge 自动恢复失败。请重试，或在 Settings → 连接查看诊断。",
+          });
+          return false;
+        } finally {
+          setManagedBridgeBusy("");
+        }
+      })();
+      bridgeRecoveryPromiseRef.current = recovery;
+      try {
+        return await recovery;
+      } finally {
+        bridgeRecoveryPromiseRef.current = null;
+      }
+    },
+    [managedBridgeStartOptions, refresh],
+  );
+  recoverManagedBridgeRef.current = recoverManagedBridge;
+
+  useEffect(
+    () => () => {
+      if (bridgeRecoveryHideTimerRef.current !== null) {
+        window.clearTimeout(bridgeRecoveryHideTimerRef.current);
+      }
+    },
+    [],
+  );
+
   const runManagedBridgeCommand = useCallback(
     async (action: "start" | "restart", workspaceOverride = "", coreRootOverride = "") => {
       if (!isTauriRuntime()) return;
@@ -5159,9 +6925,11 @@ export function App() {
             if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
           });
         }, 250);
+        return payload;
       } catch (err) {
         managedBridgeAutoSyncKey.current = "";
         setManagedBridgeError(userFacingErrorMessage(err));
+        return undefined;
       } finally {
         setManagedBridgeBusy("");
       }
@@ -5195,23 +6963,22 @@ export function App() {
   }, [providerEnvText]);
 
   const validateProviderDraft = useCallback(async () => {
-    if (!isTauriRuntime()) {
-      setProviderConfigError("Provider 验证需要在 Tauri 桌面 app 内执行。");
+    if (!bridgeApiReady) {
+      setProviderConfigError("Bridge 尚未连接，无法验证 Provider。");
       return;
     }
     setProviderBusy("validate");
     setProviderConfigError("");
     try {
-      const payload = await invoke<ProviderValidationResult>("provider_config_validate", {
-        request: {
-          workspace: selectedProjectPath || undefined,
-          coreRoot: selectedCoreRoot || undefined,
+      const payload = await api<ProviderValidationResult>("/api/providers/validate", {
+        method: "POST",
+        body: JSON.stringify({
           profile: providerDraft.profile,
-          baseUrl: providerDraft.baseUrl,
-          apiKey: providerDraft.apiKey || undefined,
+          base_url: providerDraft.baseUrl,
+          api_key: providerDraft.apiKey || undefined,
           model: providerDraft.model,
-          wireApi: providerDraft.wireApi,
-        },
+          wire_api: providerDraft.wireApi,
+        }),
       });
       setProviderValidation(payload);
     } catch (err) {
@@ -5219,38 +6986,38 @@ export function App() {
     } finally {
       setProviderBusy("");
     }
-  }, [providerDraft, selectedCoreRoot, selectedProjectPath]);
+  }, [api, bridgeApiReady, providerDraft]);
 
   const applyProviderDraft = useCallback(async () => {
-    if (!isTauriRuntime()) {
-      setProviderConfigError("Provider 配置需要在 Tauri 桌面 app 内保存。");
+    if (!bridgeApiReady) {
+      setProviderConfigError("Bridge 尚未连接，无法保存 Provider。");
       return;
     }
     setProviderBusy("apply");
     setProviderConfigError("");
     try {
-      const payload = await invoke<ProviderConfigPayload>("provider_config_apply", {
-        request: {
-          workspace: selectedProjectPath || undefined,
-          coreRoot: selectedCoreRoot || undefined,
+      const payload = await api<ProviderPayload>("/api/providers/config", {
+        method: "PUT",
+        body: JSON.stringify({
           profile: providerDraft.profile,
-          baseUrl: providerDraft.baseUrl,
-          apiKey: providerDraft.apiKey || undefined,
+          base_url: providerDraft.baseUrl,
+          api_key: providerDraft.apiKey || undefined,
           model: providerDraft.model,
-          wireApi: providerDraft.wireApi,
-        },
+          wire_api: providerDraft.wireApi,
+        }),
       });
-      setProviderConfig(payload);
-      setProviderDraft(providerDraftFromPayload(payload));
-      setModel(payload.model || providerDraft.model);
-      await runManagedBridgeCommand(managedBridge?.running ? "restart" : "start", selectedProjectPath, selectedCoreRoot);
-      await loadProviderConfig();
+      const refreshed = await api<ProviderPayload>("/api/providers?check=true");
+      const config = refreshed.config ?? payload.config;
+      setProvider(refreshed);
+      setProviderConfig(config ?? null);
+      setProviderDraft(providerDraftFromPayload(config));
+      setModel(config?.model || providerDraft.model);
     } catch (err) {
       setProviderConfigError(userFacingErrorMessage(err));
     } finally {
       setProviderBusy("");
     }
-  }, [loadProviderConfig, managedBridge?.running, providerDraft, runManagedBridgeCommand, selectedCoreRoot, selectedProjectPath]);
+  }, [api, bridgeApiReady, providerDraft]);
 
   const refreshManagedBridge = useCallback(async () => {
     if (!isTauriRuntime()) return;
@@ -5294,18 +7061,43 @@ export function App() {
   }, []);
 
   const syncManagedBridgeToWorkspace = useCallback(
-    (workspace: string) => {
+    async (workspace: string): Promise<boolean> => {
       const target = normalizeProjectPath(workspace);
-      if (!isTauriRuntime() || !target || managedBridgeBusyAny) return;
-      const coreMatches = !selectedCoreRoot || sameProjectPath(managedBridge?.core_root, selectedCoreRoot);
-      if (managedBridge?.running && sameProjectPath(managedBridge.workspace, target) && coreMatches) {
-        if (managedBridge.url) setBridgeUrl(managedBridge.url);
-        return;
-      }
-      const action = managedBridge?.running ? "restart" : "start";
-      void runManagedBridgeCommand(action, target);
+      if (!target) return false;
+      if (!isTauriRuntime()) return true;
+
+      const previous = managedBridgeWorkspaceSyncRef.current?.promise ?? Promise.resolve(true);
+      let syncPromise: Promise<boolean>;
+      syncPromise = previous
+        .catch(() => false)
+        .then(async () => {
+          let status = managedBridge;
+          try {
+            status = await invoke<ManagedBridgeStatus>("bridge_status");
+            setManagedBridge(status);
+            if (status.url) setBridgeUrl(status.url);
+          } catch {
+            // The start/restart command below reports an actionable error.
+          }
+          const coreMatches = !selectedCoreRoot || sameProjectPath(status?.core_root, selectedCoreRoot);
+          if (status?.running && sameProjectPath(status.workspace, target) && coreMatches) return true;
+          const action = status?.running ? "restart" : "start";
+          const result = await runManagedBridgeCommand(action, target);
+          return Boolean(
+            result?.running &&
+              sameProjectPath(result.workspace, target) &&
+              (!selectedCoreRoot || sameProjectPath(result.core_root, selectedCoreRoot)),
+          );
+        })
+        .finally(() => {
+          if (managedBridgeWorkspaceSyncRef.current?.promise === syncPromise) {
+            managedBridgeWorkspaceSyncRef.current = null;
+          }
+        });
+      managedBridgeWorkspaceSyncRef.current = { target, promise: syncPromise };
+      return syncPromise;
     },
-    [managedBridge, managedBridgeBusyAny, runManagedBridgeCommand, selectedCoreRoot],
+    [managedBridge, runManagedBridgeCommand, selectedCoreRoot],
   );
 
   useEffect(() => {
@@ -5328,7 +7120,7 @@ export function App() {
     const key = `${action}:${target}:${source}:${selectedCoreRoot}:${sourceCore}`;
     if (managedBridgeAutoSyncKey.current === key) return;
     managedBridgeAutoSyncKey.current = key;
-    syncManagedBridgeToWorkspace(target);
+    void syncManagedBridgeToWorkspace(target);
   }, [
     activeProject?.path,
     activeProjectPath,
@@ -5347,6 +7139,7 @@ export function App() {
     clearSessionListErrors();
     const nextProject = { ...project, last_opened_at_ms: Date.now() };
     setProjects((current) => upsertProject(current, nextProject));
+    persistActiveProject(nextProject.path);
     setActiveProjectPath(nextProject.path);
     setProjectPathInput(nextProject.path);
     setProjectError("");
@@ -5358,7 +7151,7 @@ export function App() {
     setFileTree(null);
     setFilePreview(null);
     setGitStatus(null);
-    syncManagedBridgeToWorkspace(nextProject.path);
+    void syncManagedBridgeToWorkspace(nextProject.path);
   }, [activateSession, clearSessionListErrors, sessions, syncManagedBridgeToWorkspace]);
 
   const selectProjectSession = useCallback(
@@ -5374,11 +7167,12 @@ export function App() {
         last_opened_at_ms: Date.now(),
       };
       setProjects((current) => upsertProject(current, nextProject));
+      persistActiveProject(nextProject.path);
       setActiveProjectPath(nextProject.path);
       setProjectPathInput(nextProject.path);
       setProjectError("");
       const epoch = activateSession(id, nextProject.path);
-      syncManagedBridgeToWorkspace(nextProject.path);
+      void syncManagedBridgeToWorkspace(nextProject.path);
       refreshSessionMessages(id, epoch).catch((err: unknown) => {
         if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
       });
@@ -5397,14 +7191,16 @@ export function App() {
       setProjectBusy(busyKey);
       setProjectError("");
       setProjects((current) => upsertProject(current, nextProject));
+      persistActiveProject(nextProject.path);
       setActiveProjectPath(nextProject.path);
       setProjectPathInput(nextProject.path);
       activateSession("", nextProject.path);
       setFileTree(null);
       setFilePreview(null);
       setGitStatus(null);
-      syncManagedBridgeToWorkspace(nextProject.path);
       try {
+        const bridgeReady = await syncManagedBridgeToWorkspace(nextProject.path);
+        if (!bridgeReady) throw new Error("Bridge could not switch to this workspace.");
         const payload = await api<CreateSessionPayload>("/api/sessions", {
           method: "POST",
           body: JSON.stringify({
@@ -5412,6 +7208,7 @@ export function App() {
           }),
         });
         const id = payload.session_id ?? payload.id ?? sessionId(payload.session ?? {});
+        if (!id) throw new Error("Bridge did not return a persisted session id.");
         const session = createdSessionSummary(payload, nextProject.path);
         if (session) setSessions((current) => upsertSessionSummary(current, session));
         activateSession(id, nextProject.path);
@@ -5444,7 +7241,7 @@ export function App() {
 
       setActiveProjectPath(fallbackPath);
       setProjectPathInput(fallbackPath);
-      if (!fallbackPath) window.localStorage.removeItem(STORAGE_ACTIVE_PROJECT);
+      persistActiveProject(fallbackPath);
       const stored = storedActiveSession(fallbackPath);
       const restorable = sessions.find(
         (session) => sessionId(session) === stored && !isArchivedSession(session) && sameProjectPath(session.workspace, fallbackPath),
@@ -5453,7 +7250,7 @@ export function App() {
       setFileTree(null);
       setFilePreview(null);
       setGitStatus(null);
-      if (fallbackPath) syncManagedBridgeToWorkspace(fallbackPath);
+      if (fallbackPath) void syncManagedBridgeToWorkspace(fallbackPath);
     },
     [
       activeProjectPath,
@@ -5470,13 +7267,14 @@ export function App() {
   const registerProject = useCallback((project: DesktopProject) => {
     clearSessionListErrors();
     setProjects((current) => upsertProject(current, project));
+    persistActiveProject(project.path);
     setActiveProjectPath(project.path);
     setProjectPathInput(project.path);
     activateSession("", project.path);
     setFileTree(null);
     setFilePreview(null);
     setGitStatus(null);
-    syncManagedBridgeToWorkspace(project.path);
+    void syncManagedBridgeToWorkspace(project.path);
   }, [activateSession, clearSessionListErrors, syncManagedBridgeToWorkspace]);
 
   const addProject = useCallback(
@@ -5578,14 +7376,189 @@ export function App() {
   }, [applyHarnessRoot]);
 
   const openOverviewPanel = useCallback(() => {
-    setInspectorMode("overview");
     setInspectorOpen(true);
   }, []);
 
+  const runGitWorkflowAction = useCallback(
+    async (action: GitWorkflowAction, input: JsonRecord) => {
+      const session = activeSessionIdRef.current;
+      if (!session || gitWorkflowBusy) return;
+      setGitWorkflowBusy(action);
+      setGitWorkflowError("");
+      try {
+        await api("/api/git/workflow/actions", {
+          method: "POST",
+          body: JSON.stringify({ session_id: session, action, ...input }),
+        });
+        await Promise.all([
+          refreshInteractions("turn/approval_requested"),
+          refreshWorkspaceContext(reviewSelectedPathRef.current, sessionViewEpochRef.current),
+        ]);
+      } catch (err) {
+        setGitWorkflowError(userFacingErrorMessage(err));
+      } finally {
+        setGitWorkflowBusy("");
+      }
+    },
+    [api, gitWorkflowBusy, refreshInteractions, refreshWorkspaceContext],
+  );
+
+  const generateGitWorkflowSummary = useCallback(
+    async (baseBranch: string, title: string) => {
+      const session = activeSessionIdRef.current;
+      if (!session || gitWorkflowBusy) return;
+      setGitWorkflowBusy("summary");
+      setGitWorkflowError("");
+      try {
+        await api("/api/git/workflow/summary", {
+          method: "POST",
+          body: JSON.stringify({
+            session_id: session,
+            base_branch: baseBranch,
+            title: title.trim() || undefined,
+          }),
+        });
+        await refreshWorkspaceContext(reviewSelectedPathRef.current, sessionViewEpochRef.current);
+      } catch (err) {
+        setGitWorkflowError(userFacingErrorMessage(err));
+      } finally {
+        setGitWorkflowBusy("");
+      }
+    },
+    [api, gitWorkflowBusy, refreshWorkspaceContext],
+  );
+
+  const respondGitWorkflowApproval = useCallback(
+    async (action: "allow" | "deny") => {
+      if (!pendingGitWorkflowApproval?.request_id || gitWorkflowBusy) return;
+      setGitWorkflowBusy(`approval:${action}`);
+      setGitWorkflowError("");
+      try {
+        await respondApproval(pendingGitWorkflowApproval, action);
+        await Promise.all([
+          refreshInteractions("turn/approval_resolved"),
+          refreshWorkspaceContext(reviewSelectedPathRef.current, sessionViewEpochRef.current),
+        ]);
+      } catch (err) {
+        setGitWorkflowError(userFacingErrorMessage(err));
+      } finally {
+        setGitWorkflowBusy("");
+      }
+    },
+    [
+      gitWorkflowBusy,
+      pendingGitWorkflowApproval,
+      refreshInteractions,
+      refreshWorkspaceContext,
+      respondApproval,
+    ],
+  );
+
   const openReviewPanel = useCallback(() => {
-    setInspectorMode("review");
-    setInspectorOpen(true);
-  }, []);
+    const path = latestReviewPatch?.path || reviewFiles[0]?.path || "";
+    reviewSelectedPathRef.current = path;
+    setReviewSelectedPath(path);
+    setWorkspaceView("review");
+    setInspectorOpen(false);
+    if (path) {
+      refreshWorkspaceContext(path, sessionViewEpochRef.current).catch((err: unknown) => {
+        if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
+      });
+    }
+  }, [latestReviewPatch?.path, refreshWorkspaceContext, reviewFiles]);
+
+  const selectReviewPath = useCallback(
+    (path: string) => {
+      reviewSelectedPathRef.current = path;
+      setReviewSelectedPath(path);
+      refreshWorkspaceContext(path, sessionViewEpochRef.current).catch((err: unknown) => {
+        if (!isInitialBridgeFetchError(err)) setError(userFacingErrorMessage(err));
+      });
+    },
+    [refreshWorkspaceContext],
+  );
+
+  const undoSelectedReviewFile = useCallback(async () => {
+    const path = reviewSelectedPath.trim();
+    if (!activeSessionId || !path || reviewUndoBusy) return;
+    setReviewUndoBusy(true);
+    setError("");
+    try {
+      const payload = await api<{ events?: AppEvent[] }>(
+        `/api/sessions/${encodeURIComponent(activeSessionId)}/files/undo`,
+        {
+          method: "POST",
+          body: JSON.stringify({ path, run_id: currentReviewPatch?.runId || undefined }),
+        },
+      );
+      addEvents(payload.events ?? []);
+      await refreshSessionMessages(activeSessionId);
+      await refreshSessionTrust(activeSessionId);
+      await refreshWorkspaceContext(path, sessionViewEpochRef.current);
+    } catch (err) {
+      setError(userFacingErrorMessage(err));
+    } finally {
+      setReviewUndoBusy(false);
+    }
+  }, [
+    activeSessionId,
+    addEvents,
+    api,
+    currentReviewPatch?.runId,
+    refreshSessionMessages,
+    refreshSessionTrust,
+    refreshWorkspaceContext,
+    reviewSelectedPath,
+    reviewUndoBusy,
+  ]);
+
+  const finishChangeReview = useCallback(
+    async (status: "accepted" | "changes_requested") => {
+      if (!activeSessionId || reviewDecisionBusy) return;
+      setReviewDecisionBusy(true);
+      setError("");
+      try {
+        const payload = await api<{ session?: SessionSummary }>(
+          `/api/sessions/${encodeURIComponent(activeSessionId)}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              change_review: {
+                status,
+                patch_id: latestReviewPatch?.id || "",
+                path: currentReviewPatch?.path || reviewSelectedPath,
+                run_id: currentReviewPatch?.runId || latestReviewPatch?.runId || "",
+              },
+            }),
+          },
+        );
+        if (payload.session) {
+          setSessions((current) =>
+            current.map((session) => (sessionId(session) === activeSessionId ? payload.session ?? session : session)),
+          );
+        }
+        setWorkspaceView("conversation");
+        if (status === "changes_requested") {
+          setPrompt((current) => current || "请根据审查意见继续修改：");
+          window.requestAnimationFrame(() => composerInputRef.current?.focus());
+        }
+      } catch (err) {
+        setError(userFacingErrorMessage(err));
+      } finally {
+        setReviewDecisionBusy(false);
+      }
+    },
+    [
+      activeSessionId,
+      api,
+      currentReviewPatch?.path,
+      currentReviewPatch?.runId,
+      latestReviewPatch?.id,
+      latestReviewPatch?.runId,
+      reviewDecisionBusy,
+      reviewSelectedPath,
+    ],
+  );
 
   const openSettingsPage = useCallback((page: SettingsPage) => {
     setSettingsPage(page);
@@ -5623,6 +7596,7 @@ export function App() {
   const renderTimelineMessage = ({ message, index }: TimelineMessageItem) => {
     const role = messageRoleLabel(message);
     const content = messageContent(message);
+    const finalResult = finalResultFromMessage(message);
     const terminalRunStatus = terminalTurnStatusById.get(message.info?.run_id ?? "") ?? "";
     const parts = visibleMessageParts(message, activeResolvedInteractionKeys, terminalRunStatus);
     const attachments = attachmentSummariesFromMessage(message);
@@ -5638,6 +7612,7 @@ export function App() {
             <span>{message.info?.status ?? "completed"}</span>
           </div>
           {content ? <TextContent text={content} /> : null}
+          {finalResult ? <FinalResultCard result={finalResult} /> : null}
           {attachments.length ? <AttachmentChips attachments={attachments} /> : null}
           <MessagePartCards parts={parts} />
         </div>
@@ -5731,21 +7706,21 @@ export function App() {
                   {providerConfig?.base_url ?? managedBridge?.provider?.base_url ?? "-"}
                 </dd>
                 <dt>Models</dt>
-                <dd>{provider?.model_count ?? "-"}</dd>
+                <dd>{provider?.models?.length ?? provider?.model_count ?? "-"}</dd>
                 <dt>Current model</dt>
                 <dd>{providerConfig?.model ?? provider?.model ?? model ?? "-"}</dd>
+                <dt>Wire API</dt>
+                <dd>{providerConfig?.wire_api ?? provider?.wire_api ?? "-"}</dd>
                 <dt>API key</dt>
                 <dd>{providerConfig?.api_key_configured || managedBridge?.provider?.api_key_configured ? "configured" : "-"}</dd>
-                <dt>Env file</dt>
-                <dd title={providerConfig?.env_file ?? managedBridge?.provider?.env_file ?? desktopDiagnostics?.provider?.env_file ?? ""}>
-                  {compactPath(providerConfig?.env_file ?? managedBridge?.provider?.env_file ?? desktopDiagnostics?.provider?.env_file ?? undefined)}
-                </dd>
+                <dt>Storage</dt>
+                <dd>{providerConfig?.storage === "bridge_private_state" ? "Bridge private state" : "Runtime environment"}</dd>
               </dl>
             </section>
             <section className="settings-section">
               <div className="settings-section-heading compact">
                 <h3>模型配置</h3>
-                <p>保存后会写入本地私有 env 文件，并重启当前 Bridge。</p>
+                <p>由 Bridge 私密持久化，保存后立即作用于后续任务，无需重启。</p>
               </div>
               <div className="provider-config-form">
                 <label>
@@ -5801,8 +7776,8 @@ export function App() {
                   {providerBusy === "validate" ? "验证中" : "验证连接"}
                 </button>
                 <button disabled={providerBusy === "apply" || managedBridgeBusyAny} onClick={applyProviderDraft} type="button">
-                  <RefreshCw size={15} />
-                  {providerBusy === "apply" ? "应用中" : "应用并重启"}
+                  <Check size={15} />
+                  {providerBusy === "apply" ? "保存中" : "保存并应用"}
                 </button>
                 <button disabled={providerBusy !== ""} onClick={loadProviderConfig} type="button">
                   <RotateCcw size={15} />
@@ -5823,9 +7798,57 @@ export function App() {
               ) : null}
             </section>
             <section className="settings-section">
+              <div className="settings-section-heading compact provider-catalog-heading">
+                <div>
+                  <h3>模型目录</h3>
+                  <p>能力来自 Bridge catalog；远端返回的未知模型会使用保守推断。</p>
+                </div>
+                <span className={`status-pill ${(providerValidation?.models_ok ?? (provider?.model_endpoint_checked && provider?.model_endpoint_ok)) ? "ok" : provider?.model_endpoint_checked ? "bad" : "neutral"}`}>
+                  {(providerValidation?.models_ok ?? (provider?.model_endpoint_checked && provider?.model_endpoint_ok)) ? "已同步" : provider?.model_endpoint_checked ? "同步失败" : "未同步"}
+                </span>
+              </div>
+              <div className="provider-model-catalog">
+                {providerCatalogModels.map((item) => {
+                  const capabilities = item.capabilities ?? {};
+                  const selectable = capabilities.selectable !== false;
+                  return (
+                    <button
+                      className={`provider-model-row ${item.id === providerDraft.model ? "selected" : ""}`}
+                      disabled={!selectable}
+                      key={item.id}
+                      onClick={() => item.id && updateProviderDraft({ model: item.id })}
+                      type="button"
+                    >
+                      <span className="provider-model-identity">
+                        <strong>{modelDisplayName(item.id ?? "")}</strong>
+                        <small>{item.id} · {item.source ?? "catalog"}</small>
+                      </span>
+                      <span className="provider-capability-list">
+                        {(capabilities.output_modalities ?? ["text"]).map((value) => (
+                          <span className="provider-capability" key={`${item.id}:output:${value}`}>{value}</span>
+                        ))}
+                        {capabilities.responses ? <span className="provider-capability">Responses</span> : null}
+                        {capabilities.chat_completions ? <span className="provider-capability">Chat</span> : null}
+                        {capabilities.streaming ? <span className="provider-capability">stream</span> : null}
+                        {capabilities.reasoning ? <span className="provider-capability">reasoning</span> : null}
+                        {capabilities.tools ? <span className="provider-capability">tools</span> : null}
+                        {capabilities.context_window ? (
+                          <span className="provider-capability">{formatContextTokens(capabilities.context_window)} context</span>
+                        ) : null}
+                      </span>
+                      <span className="provider-model-selection">
+                        {!selectable ? "仅展示" : item.id === providerDraft.model ? <Check size={15} /> : null}
+                      </span>
+                    </button>
+                  );
+                })}
+                {!providerCatalogModels.length ? <p className="settings-empty compact">连接 Bridge 后加载模型目录。</p> : null}
+              </div>
+            </section>
+            <section className="settings-section">
               <div className="settings-section-heading compact">
-                <h3>Env 形式</h3>
-                <p>支持粘贴 JSON env 或 KEY=value；保存时会转换成 Runtime 使用的 OpenAI-compatible 变量。</p>
+                <h3>兼容导入</h3>
+                <p>支持粘贴 JSON env 或 KEY=value；API Key 仅填入表单，保存后不会回显。</p>
               </div>
               <textarea
                 className="provider-env-import"
@@ -5838,14 +7861,6 @@ export function App() {
                   <FileText size={15} />
                   从 env 填入表单
                 </button>
-              </div>
-              <div className="provider-env-preview">
-                {(providerConfig?.env_preview ?? []).map((item) => (
-                  <div key={item.key}>
-                    <span>{item.key}</span>
-                    <code>{item.value || (item.secret ? "未配置" : "-")}</code>
-                  </div>
-                ))}
               </div>
             </section>
           </div>
@@ -5933,6 +7948,20 @@ export function App() {
                 <dd title={desktopDiagnostics?.session_root_default ?? ""}>{compactPath(desktopDiagnostics?.session_root_default)}</dd>
                 <dt>PID</dt>
                 <dd>{managedBridge?.pid ?? "-"}</dd>
+                <dt>Lifecycle</dt>
+                <dd>
+                  <span className={`stream-state ${statusClass(managedBridge?.lifecycle ?? "stopped")}`}>
+                    {managedBridge?.lifecycle ?? "stopped"}
+                  </span>
+                </dd>
+                <dt>Generation</dt>
+                <dd>{managedBridge?.generation ?? 0}</dd>
+                <dt>Recoveries</dt>
+                <dd>{managedBridge?.recovery_count ?? 0}</dd>
+                <dt>Unexpected exits</dt>
+                <dd>{managedBridge?.unexpected_exit_count ?? 0}</dd>
+                <dt>Last exit</dt>
+                <dd>{formatTime(managedBridge?.last_exit_at_ms ?? undefined)}</dd>
                 <dt>Workspace</dt>
                 <dd title={managedBridge?.workspace ?? desktopDiagnostics?.workspace_default ?? ""}>
                   {compactPath(managedBridge?.workspace ?? desktopDiagnostics?.workspace_default)}
@@ -6168,6 +8197,9 @@ export function App() {
                     const lifecycleStatus = mcpLifecycleStatusLabel(server);
                     const lifecycleRunning = ["running", "ready", "connected"].includes(lifecycleStatus);
                     const lifecycleBusy = serverName ? mcpMutationBusy.startsWith("lifecycle:") && mcpMutationBusy.endsWith(`:${serverName}`) : false;
+                    const oauthStatus = mcpOAuthStatusLabel(server);
+                    const oauthBusy = serverName ? mcpMutationBusy.startsWith("oauth:") && mcpMutationBusy.endsWith(`:${serverName}`) : false;
+                    const oauthPolling = mcpOAuthPollingServer === serverName;
                     return (
                       <section className="mcp-server-row" key={server.name ?? mcpEndpointLabel(server)}>
                         <div className="mcp-server-heading">
@@ -6277,7 +8309,54 @@ export function App() {
                             <span>started {mcpLifecycleTimeLabel(server.lifecycle_started_at)}</span>
                             <span>runtime tools {server.lifecycle_tool_count ?? "-"}</span>
                           </div>
-                        ) : null}
+                        ) : (
+                          <div className="mcp-oauth-strip" data-testid={`mcp-oauth-${serverName}`}>
+                            <span className={`stream-state ${mcpOAuthStatusClass(server)}`}>
+                              {oauthPolling ? "authorizing" : oauthStatus}
+                            </span>
+                            <span>{server.oauth?.connected ? "OAuth connected" : "OAuth not connected"}</span>
+                            {server.oauth?.expires_at ? <span>expires {mcpLifecycleTimeLabel(server.oauth.expires_at)}</span> : null}
+                            <div className="mcp-oauth-actions">
+                              <button
+                                className="icon-button mini"
+                                type="button"
+                                aria-label={`Connect OAuth for MCP server ${server.name ?? ""}`}
+                                title={server.oauth?.connected ? "Reconnect OAuth" : "Connect OAuth"}
+                                disabled={Boolean(mcpMutationBusy) || !server.name || oauthPolling}
+                                onClick={() => {
+                                  controlMcpOAuth(server, "login");
+                                }}
+                              >
+                                <PlugZap size={12} />
+                              </button>
+                              <button
+                                className="icon-button mini"
+                                type="button"
+                                aria-label={`Refresh OAuth for MCP server ${server.name ?? ""}`}
+                                title="Refresh OAuth token"
+                                disabled={Boolean(mcpMutationBusy) || !server.name || !server.oauth?.refreshable}
+                                onClick={() => {
+                                  controlMcpOAuth(server, "refresh");
+                                }}
+                              >
+                                <RefreshCw size={12} className={mcpMutationBusy === `oauth:refresh:${serverName}` ? "spin" : ""} />
+                              </button>
+                              <button
+                                className="icon-button mini danger"
+                                type="button"
+                                aria-label={`Disconnect OAuth for MCP server ${server.name ?? ""}`}
+                                title="Disconnect OAuth"
+                                disabled={Boolean(mcpMutationBusy) || !server.name || (oauthStatus === "disconnected" && !oauthPolling)}
+                                onClick={() => {
+                                  controlMcpOAuth(server, "revoke");
+                                }}
+                              >
+                                <XCircle size={12} />
+                              </button>
+                            </div>
+                            {oauthBusy ? <span>updating</span> : null}
+                          </div>
+                        )}
                         <dl className="mcp-server-meta">
                           <div>
                             <dt>Tools</dt>
@@ -6289,7 +8368,17 @@ export function App() {
                           </div>
                           <div>
                             <dt>Auth</dt>
-                            <dd>{server.header_count ? `${server.header_count} headers` : "none"}</dd>
+                            <dd>
+                              {localServer
+                                ? server.header_count
+                                  ? `${server.header_count} headers`
+                                  : "none"
+                                : server.oauth?.connected
+                                  ? "OAuth"
+                                  : server.header_count
+                                    ? `${server.header_count} headers`
+                                    : "none"}
+                            </dd>
                           </div>
                           <div>
                             <dt>Env</dt>
@@ -6300,7 +8389,11 @@ export function App() {
                             <dd>{serverBusy ? "testing" : mcpCheckedLabel(server)}</dd>
                           </div>
                         </dl>
-                        {server.last_error ? <p className="stream-error">{userFacingErrorMessage(new Error(server.last_error))}</p> : null}
+                        {server.oauth?.last_error ? (
+                          <p className="stream-error">{userFacingErrorMessage(new Error(server.oauth.last_error))}</p>
+                        ) : server.last_error ? (
+                          <p className="stream-error">{userFacingErrorMessage(new Error(server.last_error))}</p>
+                        ) : null}
                         {tools.length ? (
                           <div className="mcp-tool-list">
                             {tools.slice(0, 6).map((tool) => (
@@ -6331,44 +8424,180 @@ export function App() {
           <div className="settings-content-grid">
             <section className="settings-section">
               <div className="settings-section-heading">
-                <h2>电脑操控</h2>
-                <p>运行本地终端诊断命令。</p>
+                <h2>能力与权限</h2>
+                <p>Browser、Computer 和 Terminal 由 Bridge 独立管理；Runtime 在每次工具执行前强制检查。</p>
               </div>
-              <form className="terminal-run-form" onSubmit={runTerminalCommand}>
-                <input
-                  aria-label="Terminal command"
-                  value={terminalCommand}
-                  onChange={(event) => setTerminalCommand(event.target.value)}
-                  placeholder="pwd"
-                />
-                <button disabled={terminalBusy || !terminalCommand.trim()} type="submit">
-                  {terminalBusy ? "Running" : "Run"}
+              <div className="capability-list">
+                {(capabilities.capabilities ?? []).map((capability) => {
+                  const busy = capabilityBusy.endsWith(`:${capability.id}`);
+                  const ready = capability.available && capability.enabled && capability.policy !== "deny";
+                  const statusLabel = capability.status === "ready"
+                    ? "可用"
+                    : capability.status === "disabled"
+                      ? "已停用"
+                      : capability.status === "blocked"
+                        ? "已阻止"
+                        : "不可用";
+                  const icon = capability.id === "browser"
+                    ? <Search size={16} />
+                    : capability.id === "terminal"
+                      ? <Terminal size={16} />
+                      : <PanelRight size={16} />;
+                  return (
+                    <article className={`capability-card ${ready ? "ready" : capability.status ?? ""}`} key={capability.id}>
+                      <div className="capability-card-heading">
+                        <div className="capability-icon">{icon}</div>
+                        <div>
+                          <strong>{capability.label ?? capability.id}</strong>
+                          <p>{capability.description}</p>
+                        </div>
+                        <span className={`status-pill ${ready ? "ok" : "neutral"}`}>{statusLabel}</span>
+                      </div>
+                      <div className="capability-controls">
+                        <label>
+                          <span>权限</span>
+                          <select
+                            aria-label={`${capability.label ?? capability.id} permission policy`}
+                            disabled={busy}
+                            value={capability.policy ?? "deny"}
+                            onChange={(event) => updateCapability(capability, { policy: event.target.value as CapabilityPolicy })}
+                          >
+                            <option value="allow">允许</option>
+                            <option value="ask">每次询问</option>
+                            <option value="deny">拒绝</option>
+                          </select>
+                        </label>
+                        <button
+                          aria-label={`${capability.enabled ? "Disable" : "Enable"} ${capability.label ?? capability.id}`}
+                          className="capability-toggle"
+                          disabled={busy || !capability.available}
+                          onClick={() => updateCapability(capability, { enabled: !capability.enabled })}
+                          type="button"
+                        >
+                          <span className={`settings-switch ${capability.enabled ? "on" : ""}`} />
+                        </button>
+                        <button
+                          className="secondary-action compact"
+                          disabled={busy}
+                          onClick={() => diagnoseCapability(capability)}
+                          type="button"
+                        >
+                          <RefreshCw className={capabilityBusy === `diagnose:${capability.id}` ? "spin" : ""} size={13} />
+                          诊断
+                        </button>
+                      </div>
+                      <dl className="capability-details">
+                        <div><dt>Backend</dt><dd>{capability.backend ?? "-"}</dd></div>
+                        <div><dt>Tools</dt><dd>{capability.tools?.length ? capability.tools.join(", ") : "none"}</dd></div>
+                        <div><dt>Last check</dt><dd>{capability.last_checked_at_ms ? formatElapsed(capability.last_checked_at_ms, nowMs) : "not run"}</dd></div>
+                      </dl>
+                      {capability.last_error || capability.availability_error ? (
+                        <p className="capability-diagnostic error">{capability.last_error || capability.availability_error}</p>
+                      ) : capability.diagnostic ? (
+                        <p className="capability-diagnostic">{capability.diagnostic}</p>
+                      ) : null}
+                    </article>
+                  );
+                })}
+                {capabilities.capabilities?.length ? null : (
+                  <p className="muted-line">Bridge 尚未返回 capability contract。</p>
+                )}
+              </div>
+              {capabilityError ? <p className="stream-error">{capabilityError}</p> : null}
+            </section>
+
+            <section className="settings-section">
+              <div className="settings-section-heading compact">
+                <h3>Terminal</h3>
+                <p>持久终端绑定当前 session workspace；切换会话后终端状态和输出完全隔离。</p>
+              </div>
+              <div className="terminal-session-toolbar">
+                <button
+                  className="secondary-action compact"
+                  disabled={Boolean(terminalBusy)}
+                  onClick={startTerminalSession}
+                  type="button"
+                >
+                  <Play size={13} />
+                  {terminalSession ? "新建终端" : "启动终端"}
                 </button>
-              </form>
-              {terminalResult ? (
-                <div className="terminal-output">
+                {terminalSession?.running ? (
+                  <button
+                    className="secondary-action compact"
+                    disabled={Boolean(terminalBusy)}
+                    onClick={interruptTerminalSession}
+                    type="button"
+                  >
+                    <Square size={12} />
+                    停止
+                  </button>
+                ) : null}
+                {terminalSession ? (
+                  <button
+                    aria-label="Close terminal"
+                    className="icon-button compact"
+                    disabled={Boolean(terminalBusy)}
+                    onClick={closeTerminalSession}
+                    title="关闭终端"
+                    type="button"
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                ) : null}
+                {terminalSession ? (
+                  <span className={`terminal-status ${terminalSession.status ?? ""}`}>
+                    {terminalSession.status === "running"
+                      ? "运行中"
+                      : terminalSession.status === "completed"
+                        ? "已完成"
+                        : terminalSession.status === "interrupted"
+                          ? "已停止"
+                          : "失败"}
+                  </span>
+                ) : null}
+              </div>
+              {terminalSession ? (
+                <div className="terminal-session-panel">
                   <dl className="settings-definition-grid">
                     <dt>CWD</dt>
-                    <dd title={terminalResult.cwd ?? ""}>{terminalResult.cwd_relative || compactPath(terminalResult.cwd)}</dd>
+                    <dd title={terminalSession.cwd ?? ""}>{terminalSession.cwd_relative || compactPath(terminalSession.cwd)}</dd>
+                    <dt>Shell</dt>
+                    <dd>{compactPath(terminalSession.shell)}</dd>
                     <dt>Exit</dt>
-                    <dd>{terminalResult.exit_code ?? "-"}</dd>
-                    <dt>Time</dt>
-                    <dd>{terminalResult.duration_ms ?? 0}ms</dd>
+                    <dd>{terminalSession.exit_code ?? "-"}</dd>
                   </dl>
-                  {terminalResult.stdout ? (
-                    <div>
-                      <span>stdout</span>
-                      <pre>{terminalResult.stdout}</pre>
-                    </div>
-                  ) : null}
-                  {terminalResult.stderr ? (
-                    <div>
-                      <span>stderr</span>
-                      <pre>{terminalResult.stderr}</pre>
-                    </div>
-                  ) : null}
+                  <pre className="terminal-session-output" aria-live="polite">
+                    {terminalChunks.length
+                      ? terminalChunks.map((chunk) => (
+                          <span className={chunk.stream === "stderr" ? "stderr" : ""} key={chunk.sequence}>
+                            {chunk.text}
+                          </span>
+                        ))
+                      : "终端已启动，输入命令开始。"}
+                  </pre>
+                  <form className="terminal-run-form" onSubmit={submitTerminalInput}>
+                    <input
+                      aria-label="Terminal input"
+                      disabled={!terminalSession.running}
+                      value={terminalInput}
+                      onChange={(event) => setTerminalInput(event.target.value)}
+                      placeholder={terminalSession.running ? "输入命令并回车" : "终端已结束"}
+                    />
+                    <button
+                      disabled={Boolean(terminalBusy) || !terminalSession.running || !terminalInput}
+                      type="submit"
+                    >
+                      发送
+                    </button>
+                  </form>
                 </div>
-              ) : null}
+              ) : (
+                <div className="settings-empty-panel compact">
+                  <Terminal size={18} />
+                  <strong>当前会话没有终端</strong>
+                  <span>启动后可连续执行命令并查看增量输出。</span>
+                </div>
+              )}
               {terminalError ? <p className="stream-error">{terminalError}</p> : null}
             </section>
           </div>
@@ -6481,6 +8710,194 @@ export function App() {
           </div>
         );
 
+      case "performance":
+        return (
+          <div className="settings-content-grid">
+            <section className="settings-section">
+              <div className="settings-section-heading performance-heading">
+                <div>
+                  <h2>性能与稳定性</h2>
+                  <p>在当前项目与会话上运行五项可复现基线，结果由 Bridge 保存。</p>
+                </div>
+                <button
+                  className="performance-run-button"
+                  disabled={!bridgeApiReady || performanceBusy}
+                  onClick={() => runPerformanceProbe().catch(() => {})}
+                  type="button"
+                >
+                  <RefreshCw className={performanceBusy ? "spin" : ""} size={13} />
+                  {performanceBusy ? "运行中" : performanceProbe ? "重新运行" : "运行基线"}
+                </button>
+              </div>
+
+              {performanceProbe ? (
+                <>
+                  <div className="performance-summary" aria-label="性能基线摘要">
+                    <div>
+                      <span className={`status-pill ${performanceProbe.status === "passed" ? "ok" : "warning"}`}>
+                        {performanceProbe.status === "passed" ? "通过" : "有警告"}
+                      </span>
+                      <strong>{performanceProbe.total_duration_ms ?? 0} ms</strong>
+                      <small>总耗时</small>
+                    </div>
+                    <div>
+                      <strong>{performanceProbe.full_scale_count ?? 0} / {performanceProbe.profile_count ?? 5}</strong>
+                      <small>达到目标规模</small>
+                    </div>
+                    <div>
+                      <strong>{performanceProbe.warning_count ?? 0}</strong>
+                      <small>超出预算</small>
+                    </div>
+                    <div>
+                      <strong>{performanceProbe.measured_at_ms ? new Date(performanceProbe.measured_at_ms).toLocaleString() : "-"}</strong>
+                      <small>最近运行</small>
+                    </div>
+                  </div>
+
+                  <div className="performance-profile-list">
+                    {(performanceProbe.profiles ?? []).map((profile) => {
+                      const passed = profile.status === "passed";
+                      const fullScale = profile.coverage === "full_scale";
+                      const duration = profile.duration_ms ?? 0;
+                      const budget = profile.budget_ms ?? 0;
+                      const percent = budget ? Math.min(100, Math.round((duration / budget) * 100)) : 0;
+                      return (
+                        <article aria-label={`性能基线 ${profile.label}`} className={`performance-profile ${passed ? "passed" : "warning"}`} key={profile.id}>
+                          <div className="performance-profile-heading">
+                            <span>
+                              <strong>{profile.label}</strong>
+                              <small>{performanceScaleLabel(profile)}</small>
+                            </span>
+                            <span>
+                              <strong>{duration} / {budget} ms</strong>
+                              <small>{fullScale ? "完整规模" : "样本规模"}</small>
+                            </span>
+                          </div>
+                          <div className="performance-budget-track" aria-label={`${profile.label} 预算使用 ${percent}%`}>
+                            <span style={{ width: `${percent}%` }} />
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+
+                  <p className="performance-privacy-note">
+                    <ShieldCheck size={13} />
+                    基线只保存数量、耗时和预算，不保存文件名、路径、会话正文、附件内容或凭据。
+                  </p>
+                </>
+              ) : (
+                <div className="settings-empty-panel performance-empty">
+                  <Activity size={18} />
+                  <strong>尚未运行性能基线</strong>
+                  <p>运行后会检查大仓库、长会话、大 Diff、多任务和大附件五个场景。</p>
+                </div>
+              )}
+              {performanceError ? <p className="stream-error">{performanceError}</p> : null}
+            </section>
+          </div>
+        );
+
+      case "storage": {
+        const readiness = storageStatus?.readiness ?? "checking";
+        const readinessLabel = readiness === "ready"
+          ? "可以升级"
+          : readiness === "needs_migration"
+            ? "需要迁移"
+            : readiness === "blocked"
+              ? "升级已阻止"
+              : "正在检查";
+        const latestMigration = storageStatus?.latest_migration ?? storageStatus?.migration ?? null;
+        const blockedReasons = Object.entries(storageStatus?.blocked_reasons ?? {});
+        return (
+          <div className="settings-content-grid">
+            <section className="settings-section">
+              <div className="settings-section-heading storage-heading">
+                <div>
+                  <h2>存储与升级</h2>
+                  <p>升级前检查会话与 Runtime 状态，并在迁移前创建可回滚备份。</p>
+                </div>
+                <span className={`storage-readiness ${readiness}`}>
+                  {readiness === "ready" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
+                  {readinessLabel}
+                </span>
+              </div>
+
+              {storageStatus ? (
+                <>
+                  <div className="storage-summary" aria-label="存储升级摘要">
+                    <div><strong>{storageStatus.current_session_count ?? 0} / {storageStatus.session_count ?? 0}</strong><small>当前格式会话</small></div>
+                    <div><strong>{storageStatus.legacy_session_count ?? 0}</strong><small>待迁移会话</small></div>
+                    <div><strong>{storageStatus.legacy_runtime_state_count ?? 0}</strong><small>待迁移运行状态</small></div>
+                    <div><strong>{storageStatus.planned_action_count ?? 0}</strong><small>计划变更</small></div>
+                  </div>
+
+                  <div className="storage-action-row">
+                    <span>
+                      <strong>{storageStatus.target_schema_set ?? "-"}</strong>
+                      <small>目标状态版本</small>
+                    </span>
+                    <div>
+                      <button disabled={Boolean(storageBusy)} onClick={() => refreshStorage(true).catch(() => {})} type="button">
+                        <RefreshCw className={storageBusy === "audit" ? "spin" : ""} size={13} />
+                        {storageBusy === "audit" ? "检查中" : "重新检查"}
+                      </button>
+                      {storageStatus.can_migrate ? (
+                        <button className="primary" disabled={Boolean(storageBusy)} onClick={() => migrateStorage().catch(() => {})} type="button">
+                          <Database size={13} />
+                          {storageBusy === "migrate" ? "迁移中" : "安全迁移"}
+                        </button>
+                      ) : null}
+                      {storageStatus.can_rollback ? (
+                        <button disabled={Boolean(storageBusy)} onClick={() => rollbackStorage().catch(() => {})} type="button">
+                          <RotateCcw size={13} />
+                          {storageBusy === "rollback" ? "回滚中" : "回滚最近迁移"}
+                        </button>
+                      ) : null}
+                    </div>
+                  </div>
+
+                  {latestMigration ? (
+                    <article className="storage-migration-card">
+                      <span>
+                        <strong>最近迁移</strong>
+                        <small>{latestMigration.completed_at_ms
+                          ? new Date(latestMigration.completed_at_ms).toLocaleString()
+                          : latestMigration.rolled_back_at_ms
+                            ? new Date(latestMigration.rolled_back_at_ms).toLocaleString()
+                            : "尚未完成"}</small>
+                      </span>
+                      <span><strong>{latestMigration.status ?? "unknown"}</strong><small>状态</small></span>
+                      <span><strong>{latestMigration.changed_file_count ?? 0}</strong><small>变更文件</small></span>
+                      <span><strong>{latestMigration.backup_file_count ?? 0}</strong><small>备份文件</small></span>
+                    </article>
+                  ) : null}
+
+                  {blockedReasons.length ? (
+                    <div className="storage-blocked-list">
+                      <strong>需要处理后才能升级</strong>
+                      {blockedReasons.map(([reason, count]) => <span key={reason}>{reason.replace(/_/g, " ")} · {count}</span>)}
+                    </div>
+                  ) : null}
+
+                  <p className="performance-privacy-note">
+                    <ShieldCheck size={13} />
+                    检查结果只包含版本、数量和状态，不返回文件路径、会话正文、附件内容或凭据。
+                  </p>
+                </>
+              ) : (
+                <div className="settings-empty-panel performance-empty">
+                  <Database size={18} />
+                  <strong>{storageBusy ? "正在检查存储状态" : "尚未读取存储状态"}</strong>
+                  <p>Bridge 会在升级前验证所有持久状态是否可安全迁移。</p>
+                </div>
+              )}
+              {storageError ? <p className="stream-error">{storageError}</p> : null}
+            </section>
+          </div>
+        );
+      }
+
       case "archived":
         return (
           <div className="settings-content-grid">
@@ -6525,26 +8942,184 @@ export function App() {
           <div className="settings-content-grid">
             <section className="settings-section">
               <div className="settings-section-heading">
-                <h2>插件</h2>
-                <p>管理已经接通的 MCP 与本机工具入口。</p>
+                <h2>Skills 与插件</h2>
+                <p>由 Bridge 管理安装、权限和 Runtime 生效状态。</p>
               </div>
-              <div className="settings-list">
-                {[
-                  { label: "MCP 服务器", description: "管理 server、transport、lifecycle 和工具发现。", page: "mcp" as SettingsPage, icon: <Wrench size={15} /> },
-                  { label: "电脑操控", description: "本地终端和电脑操控能力。", page: "computer" as SettingsPage, icon: <Terminal size={15} /> },
-                ].map(({ label, description, page, icon }) => (
-                  <div className="settings-list-row" key={page}>
-                    {icon}
-                    <span>
-                      <strong>{label}</strong>
-                      <small>{description}</small>
-                    </span>
-                    <button type="button" onClick={() => setSettingsPage(page)}>
-                      打开
-                    </button>
+              <dl className="settings-definition-grid">
+                <dt>已安装</dt>
+                <dd>{plugins?.plugin_count ?? installedPlugins.length}</dd>
+                <dt>已启用</dt>
+                <dd>{plugins?.enabled_plugin_count ?? installedPlugins.filter((plugin) => plugin.enabled).length}</dd>
+                <dt>可用 Skills</dt>
+                <dd>{managedSkills.filter((skill) => skill.enabled).length}</dd>
+                <dt>Runtime roots</dt>
+                <dd>{plugins?.runtime?.extra_skill_root_count ?? 0}</dd>
+              </dl>
+              <form className="plugin-install-form" onSubmit={installPlugin}>
+                <label>
+                  <span>安装来源</span>
+                  <input
+                    aria-label="Plugin source"
+                    placeholder="本地目录、SKILL.md 或 HTTPS Git 地址"
+                    value={pluginSourceDraft}
+                    onChange={(event) => setPluginSourceDraft(event.target.value)}
+                  />
+                </label>
+                <button className="plugin-primary-action" disabled={Boolean(pluginMutationBusy)} type="submit">
+                  <Plus size={13} />
+                  {pluginMutationBusy === "install" ? "安装中" : "安装"}
+                </button>
+                <button
+                  className="icon-button mini"
+                  disabled={Boolean(pluginMutationBusy)}
+                  onClick={() => refreshPlugins().catch(() => {})}
+                  title="重新发现 Skills 和插件"
+                  type="button"
+                >
+                  <RefreshCw size={13} />
+                </button>
+              </form>
+              {pluginMutationError ? <p className="stream-error">{pluginMutationError}</p> : null}
+              <div className="plugin-list">
+                {installedPlugins.length ? (
+                  installedPlugins.map((plugin) => {
+                    const id = plugin.id ?? plugin.name ?? "plugin";
+                    const expanded = pluginExpandedId === id;
+                    const busy = pluginMutationBusy.endsWith(`:${id}`);
+                    return (
+                      <div className={`plugin-row ${plugin.enabled ? "enabled" : "disabled"}`} key={id}>
+                        <div className="plugin-row-heading">
+                          <PlugZap size={15} />
+                          <span>
+                            <strong>{plugin.name || id}</strong>
+                            <small>
+                              {plugin.version || "未标版本"} · {plugin.enabled_skill_count ?? 0}/{plugin.skill_count ?? plugin.skills?.length ?? 0} skills
+                            </small>
+                          </span>
+                          <span className={`stream-state ${plugin.enabled ? "ok" : "neutral"}`}>
+                            {plugin.enabled ? "已启用" : "已停用"}
+                          </span>
+                        </div>
+                        <p>{plugin.description || "没有插件说明。"}</p>
+                        <div className="plugin-row-actions">
+                          <button
+                            className="icon-button mini"
+                            disabled={Boolean(pluginMutationBusy)}
+                            onClick={() => setPluginExpandedId(expanded ? "" : id)}
+                            title={expanded ? "收起插件详情" : "查看插件权限和 Skills"}
+                            type="button"
+                          >
+                            <ShieldCheck size={13} />
+                          </button>
+                          <button
+                            className="icon-button mini"
+                            disabled={Boolean(pluginMutationBusy)}
+                            onClick={() => updatePlugin(plugin)}
+                            title="从安装来源更新"
+                            type="button"
+                          >
+                            <RefreshCw className={pluginMutationBusy === `update:${id}` ? "spin" : ""} size={13} />
+                          </button>
+                          <button
+                            className="icon-button mini"
+                            disabled={Boolean(pluginMutationBusy)}
+                            onClick={() => togglePlugin(plugin)}
+                            title={plugin.enabled ? "停用插件" : "启用插件"}
+                            type="button"
+                          >
+                            {plugin.enabled ? <Pause size={13} /> : <Play size={13} />}
+                          </button>
+                          <button
+                            className="icon-button mini danger"
+                            disabled={Boolean(pluginMutationBusy)}
+                            onClick={() => deletePlugin(plugin)}
+                            title="删除插件"
+                            type="button"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                          {busy ? <span className="plugin-action-state">处理中</span> : null}
+                        </div>
+                        {expanded ? (
+                          <div className="plugin-details">
+                            <div>
+                              <strong>权限范围</strong>
+                              <div className="plugin-chip-list">
+                                {(plugin.permissions ?? ["skills:read"]).map((permission) => (
+                                  <span className="plugin-chip" key={permission}>{permission}</span>
+                                ))}
+                              </div>
+                            </div>
+                            <div>
+                              <strong>Skills</strong>
+                              <p>{(plugin.skills ?? []).join(" · ") || "未发现 Skill"}</p>
+                            </div>
+                            <div>
+                              <strong>来源</strong>
+                              <p className="plugin-source">{plugin.source || "unknown"}</p>
+                            </div>
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="settings-empty-panel compact">
+                    <PlugZap size={20} />
+                    <strong>还没有安装插件</strong>
+                    <span>输入本地插件目录、单个 SKILL.md 或 HTTPS Git 地址。</span>
                   </div>
-                ))}
+                )}
               </div>
+            </section>
+            <section className="settings-section">
+              <div className="settings-section-heading compact plugin-skill-heading">
+                <span>
+                  <h2>Skill 目录</h2>
+                  <p>开关会直接影响下一轮 Agent Runtime 的可见 Skill。</p>
+                </span>
+                <label className="plugin-skill-search">
+                  <Search size={13} />
+                  <input
+                    aria-label="Filter skills"
+                    placeholder="筛选 Skill"
+                    value={skillFilter}
+                    onChange={(event) => setSkillFilter(event.target.value)}
+                  />
+                </label>
+              </div>
+              <div className="settings-toggle-list plugin-skill-list">
+                {filteredManagedSkills.length ? (
+                  filteredManagedSkills.map((skill) => {
+                    const name = skill.name ?? "skill";
+                    const busy = pluginMutationBusy === `skill:${name}`;
+                    return (
+                      <button
+                        className="settings-toggle-row"
+                        disabled={Boolean(pluginMutationBusy)}
+                        key={`${skill.plugin_id ?? "builtin"}:${name}`}
+                        onClick={() => toggleManagedSkill(skill)}
+                        type="button"
+                      >
+                        <span>
+                          <strong>{name}</strong>
+                          <small>{skill.description || "没有 Skill 说明"} · {skill.plugin_id || "workspace / built-in"}</small>
+                        </span>
+                        <span className={`settings-switch ${skill.enabled ? "on" : ""} ${busy ? "busy" : ""}`} />
+                      </button>
+                    );
+                  })
+                ) : (
+                  <p className="muted-line plugin-empty-line">没有匹配的 Skill。</p>
+                )}
+              </div>
+              {(plugins?.issues ?? []).length ? (
+                <div className="plugin-issues">
+                  {(plugins?.issues ?? []).slice(0, 5).map((issue, index) => (
+                    <p key={`${issue.path ?? "issue"}:${index}`}>{issue.message || issue.kind || "Skill discovery issue"}</p>
+                  ))}
+                </div>
+              ) : null}
             </section>
           </div>
         );
@@ -6898,7 +9473,7 @@ export function App() {
       </aside>
 
       <section
-        className={`workspace ${showWorkspaceDock ? "has-dock" : ""} ${showComposerContext ? "has-context" : ""}`}
+        className={`workspace ${showWorkspaceDock ? "has-dock" : ""} ${showComposerContext ? "has-context" : ""} ${workspaceView === "review" ? "reviewing" : ""} ${workspaceView === "conversation" && bridgeRecovery.phase !== "idle" ? "has-recovery" : ""}`}
         style={workspaceStyle}
       >
         <header className="topbar">
@@ -6950,6 +9525,80 @@ export function App() {
           </div>
         </header>
 
+        {workspaceView === "review" ? (
+          <ReviewWorkspace
+            branch={gitStatus?.branch}
+            canRestoreTurn={Boolean(reviewTurnStartCheckpoint?.checkpoint_id)}
+            canUndoSelected={Boolean(
+              sessionDiff?.undo_count &&
+                reviewSelectedPath &&
+                reviewPatches.some((patch) => patch.path === reviewSelectedPath),
+            )}
+            decisionBusy={reviewDecisionBusy}
+            decisionStatus={reviewDecisionStatus}
+            error={error}
+            files={reviewFiles}
+            gitWorkflow={gitWorkflow}
+            gitWorkflowBusy={gitWorkflowBusy}
+            gitWorkflowError={gitWorkflowError}
+            hasPendingGitApproval={Boolean(pendingGitWorkflowApproval)}
+            onAccept={() => finishChangeReview("accepted")}
+            onBack={() => setWorkspaceView("conversation")}
+            onCreateBranch={(branch) => runGitWorkflowAction("create_branch", { branch })}
+            onCreateReview={(input) => runGitWorkflowAction("create_pr", input)}
+            onGenerateSummary={generateGitWorkflowSummary}
+            onGitApproval={respondGitWorkflowApproval}
+            onCommit={(message, paths) => runGitWorkflowAction("commit", { message, paths })}
+            onRedo={() => runPatchAction("redo")}
+            onRequestChanges={() => finishChangeReview("changes_requested")}
+            onRestoreTurn={() => restoreCheckpoint(reviewTurnStartCheckpoint?.checkpoint_id)}
+            onSelectPath={selectReviewPath}
+            onUndo={undoSelectedReviewFile}
+            patches={reviewPatches}
+            selectedDiff={selectedGitPatch}
+            previewContent={filePreview?.content}
+            projectLabel={activeProjectLabel || activeSession?.title || "OpenAgent"}
+            redoCount={sessionDiff?.redo_count ?? 0}
+            restoreCompleted={reviewRestoreCompleted}
+            restoreTargetId={reviewTurnStartCheckpoint?.checkpoint_id}
+            restoringTurn={restoringCheckpointId === reviewTurnStartCheckpoint?.checkpoint_id}
+            selectedPath={reviewSelectedPath || latestReviewPatch?.path || reviewFiles[0]?.path || ""}
+            undoingSelected={reviewUndoBusy}
+          />
+        ) : (
+          <>
+        {bridgeRecovery.phase !== "idle" ? (
+          <section
+            aria-live="polite"
+            className={`bridge-recovery-banner ${bridgeRecovery.phase}`}
+            data-testid="bridge-recovery-banner"
+          >
+            <span className="bridge-recovery-icon">
+              {bridgeRecovery.phase === "recovering" ? (
+                <RefreshCw className="spin" size={15} />
+              ) : bridgeRecovery.phase === "recovered" ? (
+                <CheckCircle2 size={15} />
+              ) : (
+                <XCircle size={15} />
+              )}
+            </span>
+            <div>
+              <strong>
+                {bridgeRecovery.phase === "recovering"
+                  ? "正在恢复连接"
+                  : bridgeRecovery.phase === "recovered"
+                    ? "连接已恢复"
+                    : "连接恢复失败"}
+              </strong>
+              <span>{bridgeRecovery.message}</span>
+            </div>
+            {bridgeRecovery.phase === "failed" ? (
+              <button disabled={managedBridgeBusyAny} onClick={() => void recoverManagedBridge(true)} type="button">
+                重试
+              </button>
+            ) : null}
+          </section>
+        ) : null}
         <section className={`timeline ${timelineEmpty ? "empty" : ""}`} aria-live="polite" ref={timelineRef}>
           {timelineEmpty ? (
             <div className="empty-state">
@@ -6991,11 +9640,22 @@ export function App() {
                 >
                   <div className="event-glyph">{messageIcon("assistant")}</div>
                   <div className="event-body">
-                    <TextContent text={liveFinalAnswer.text} />
+                    {liveFinalAnswer.text ? <TextContent text={liveFinalAnswer.text} /> : null}
+                    {liveFinalAnswer.result ? <FinalResultCard result={liveFinalAnswer.result} /> : null}
                   </div>
                 </article>
               ) : null}
               {deferredAssistantMessages.map(renderTimelineMessage)}
+              {sessionTaskCount ? (
+                <TaskTreeSummary
+                  onOpen={() => {
+                    const firstTaskId = taskNodeId(sessionTaskTree.flat_tasks?.[0] ?? sessionTaskTree.tree?.[0]);
+                    if (!selectedSessionTaskId && firstTaskId) setSelectedSessionTaskId(firstTaskId);
+                    setInspectorOpen(true);
+                  }}
+                  payload={sessionTaskTree}
+                />
+              ) : null}
               <div className="timeline-end" ref={timelineEndRef} />
             </>
           )}
@@ -7140,8 +9800,240 @@ export function App() {
               </div>
             </>
           ) : null}
+          {durableGoal ? (
+            <button
+              className={`goal-strip goal-${durableGoal.status}`}
+              data-testid="durable-goal-strip"
+              onClick={() => openGoalPanel().catch((err: unknown) => setGoalError(userFacingErrorMessage(err)))}
+              type="button"
+            >
+              <Target aria-hidden="true" size={14} />
+              <strong>{durableGoal.title}</strong>
+              <span>{durableGoal.status === "active" ? "进行中" : durableGoal.status === "paused" ? "已暂停" : "已完成"}</span>
+              <small>查看</small>
+            </button>
+          ) : null}
+          {durablePlan ? (
+            <button
+              className={`goal-strip plan-strip plan-${durablePlan.status}`}
+              data-testid="durable-plan-strip"
+              onClick={() => openPlanPanel().catch((err: unknown) => setPlanError(userFacingErrorMessage(err)))}
+              type="button"
+            >
+              <ListChecks aria-hidden="true" size={14} />
+              <strong>{durablePlan.title}</strong>
+              <span>
+                {durablePlan.status === "planning" ? "计划中 · 只读" : durablePlan.status === "executing" ? "执行中" : "已完成"}
+              </span>
+              <small>查看</small>
+            </button>
+          ) : null}
+          {goalPanelOpen ? (
+            <section className="goal-editor" data-testid="durable-goal-editor">
+              <header>
+                <div>
+                  <Target aria-hidden="true" size={16} />
+                  <strong>{goalCreatingNew || !durableGoal ? "创建长期目标" : "长期目标"}</strong>
+                </div>
+                <button onClick={() => setGoalPanelOpen(false)} title="关闭目标" type="button">
+                  <XCircle size={16} />
+                </button>
+              </header>
+              {goalCreatingNew || !durableGoal || durableGoal.status !== "completed" ? (
+                <div className="goal-editor-fields">
+                  <label>
+                    <span>名称</span>
+                    <input
+                      aria-label="Goal title"
+                      disabled={Boolean(goalBusy)}
+                      onChange={(event) => setGoalDraft((current) => ({ ...current, title: event.target.value }))}
+                      placeholder="例如：完成 Desktop MCP 闭环"
+                      value={goalDraft.title}
+                    />
+                  </label>
+                  <label>
+                    <span>目标</span>
+                    <textarea
+                      aria-label="Goal objective"
+                      disabled={Boolean(goalBusy)}
+                      onChange={(event) => setGoalDraft((current) => ({ ...current, objective: event.target.value }))}
+                      placeholder="描述持续推进的结果，而不是单个命令"
+                      value={goalDraft.objective}
+                    />
+                  </label>
+                  <label>
+                    <span>验收标准</span>
+                    <textarea
+                      aria-label="Goal acceptance criteria"
+                      disabled={Boolean(goalBusy)}
+                      onChange={(event) => setGoalDraft((current) => ({ ...current, acceptanceCriteria: event.target.value }))}
+                      placeholder="每行一条"
+                      value={goalDraft.acceptanceCriteria}
+                    />
+                  </label>
+                </div>
+              ) : (
+                <div className="goal-completed-summary">
+                  <strong>{durableGoal.objective}</strong>
+                  <span>{(durableGoal.acceptance_criteria ?? []).join(" · ")}</span>
+                </div>
+              )}
+              {goalError ? <p className="goal-error" role="alert">{goalError}</p> : null}
+              <footer>
+                {goalCreatingNew || !durableGoal ? (
+                  <button
+                    className="goal-primary-action"
+                    disabled={Boolean(goalBusy) || !goalDraft.objective.trim()}
+                    onClick={() => mutateDurableGoal("create")}
+                    type="button"
+                  >
+                    {goalBusy === "create" ? "创建中" : "创建目标"}
+                  </button>
+                ) : durableGoal.status === "completed" ? (
+                  <button
+                    className="goal-primary-action"
+                    onClick={() => {
+                      setGoalCreatingNew(true);
+                      setGoalDraft(EMPTY_GOAL_DRAFT);
+                    }}
+                    type="button"
+                  >
+                    新建目标
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      className="goal-primary-action"
+                      disabled={Boolean(goalBusy) || !goalDraft.objective.trim()}
+                      onClick={() => mutateDurableGoal("update")}
+                      type="button"
+                    >
+                      {goalBusy === "update" ? "保存中" : "保存"}
+                    </button>
+                    <button disabled={Boolean(goalBusy)} onClick={() => mutateDurableGoal(durableGoal.status === "paused" ? "resume" : "pause")} type="button">
+                      {durableGoal.status === "paused" ? <Play size={14} /> : <Pause size={14} />}
+                      {durableGoal.status === "paused" ? "恢复" : "暂停"}
+                    </button>
+                    <button disabled={Boolean(goalBusy)} onClick={() => mutateDurableGoal("complete")} type="button">
+                      <Check size={14} />
+                      完成
+                    </button>
+                  </>
+                )}
+              </footer>
+            </section>
+          ) : null}
+          {planPanelOpen ? (
+            <section className="goal-editor plan-editor" data-testid="durable-plan-editor">
+              <header>
+                <div>
+                  <ListChecks aria-hidden="true" size={16} />
+                  <strong>{planCreatingNew || !durablePlan ? "创建执行计划" : "执行计划"}</strong>
+                </div>
+                <button onClick={() => setPlanPanelOpen(false)} title="关闭计划" type="button">
+                  <XCircle size={16} />
+                </button>
+              </header>
+              {planCreatingNew || !durablePlan || durablePlan.status === "planning" ? (
+                <div className="goal-editor-fields">
+                  <label>
+                    <span>名称</span>
+                    <input
+                      aria-label="Plan title"
+                      disabled={Boolean(planBusy)}
+                      onChange={(event) => setPlanDraft((current) => ({ ...current, title: event.target.value }))}
+                      placeholder="例如：完成安全的会话恢复改造"
+                      value={planDraft.title}
+                    />
+                  </label>
+                  <label>
+                    <span>目标</span>
+                    <textarea
+                      aria-label="Plan objective"
+                      disabled={Boolean(planBusy)}
+                      onChange={(event) => setPlanDraft((current) => ({ ...current, objective: event.target.value }))}
+                      placeholder="规划态只能读取和分析，确认后再开始执行"
+                      value={planDraft.objective}
+                    />
+                  </label>
+                  <label>
+                    <span>步骤</span>
+                    <textarea
+                      aria-label="Plan steps"
+                      disabled={Boolean(planBusy)}
+                      onChange={(event) => setPlanDraft((current) => ({ ...current, steps: event.target.value }))}
+                      placeholder="每行一步"
+                      value={planDraft.steps}
+                    />
+                  </label>
+                </div>
+              ) : (
+                <div className="goal-completed-summary">
+                  <strong>{durablePlan.objective}</strong>
+                  <span>{(durablePlan.steps ?? []).join(" · ")}</span>
+                </div>
+              )}
+              {durablePlan?.status === "planning" ? (
+                <p className="plan-readonly-note">规划态由 Runtime 强制只读。只有点击“开始执行”后，写文件和命令工具才会按当前权限运行。</p>
+              ) : null}
+              {planError ? <p className="goal-error" role="alert">{planError}</p> : null}
+              <footer>
+                {planCreatingNew || !durablePlan ? (
+                  <button
+                    className="goal-primary-action"
+                    disabled={Boolean(planBusy) || !planDraft.objective.trim()}
+                    onClick={() => mutateDurablePlan("create")}
+                    type="button"
+                  >
+                    {planBusy === "create" ? "创建中" : "创建计划"}
+                  </button>
+                ) : durablePlan.status === "completed" ? (
+                  <button
+                    className="goal-primary-action"
+                    onClick={() => {
+                      setPlanCreatingNew(true);
+                      setPlanDraft(EMPTY_PLAN_DRAFT);
+                    }}
+                    type="button"
+                  >
+                    新建计划
+                  </button>
+                ) : durablePlan.status === "planning" ? (
+                  <>
+                    <button
+                      disabled={Boolean(planBusy) || !planDraft.objective.trim()}
+                      onClick={() => mutateDurablePlan("update")}
+                      type="button"
+                    >
+                      {planBusy === "update" ? "保存中" : "保存计划"}
+                    </button>
+                    <button
+                      className="goal-primary-action"
+                      disabled={Boolean(planBusy)}
+                      onClick={() => mutateDurablePlan("execute")}
+                      type="button"
+                    >
+                      <Play size={14} />
+                      {planBusy === "execute" ? "切换中" : "开始执行"}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    className="goal-primary-action"
+                    disabled={Boolean(planBusy)}
+                    onClick={() => mutateDurablePlan("complete")}
+                    type="button"
+                  >
+                    <Check size={14} />
+                    {planBusy === "complete" ? "完成中" : "完成计划"}
+                  </button>
+                )}
+              </footer>
+            </section>
+          ) : null}
           <form className="composer" onSubmit={submitPrompt}>
             <textarea
+              ref={composerInputRef}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               onCompositionEnd={() => {
@@ -7167,6 +10059,13 @@ export function App() {
                     contentType: attachment.contentType,
                     contentLines: attachment.content.split(/\r?\n/).length,
                     contentChars: attachment.content.length,
+                    source: attachment.source,
+                    pageCount: attachment.pageCount,
+                    mediaMetadata: attachment.mediaMetadata,
+                    truncated: attachment.truncated,
+                    truncationReason: attachment.truncationReason,
+                    originalContentBytes: attachment.originalContentBytes,
+                    includedContentBytes: attachment.includedContentBytes,
                   }))}
                   onRemove={removeComposerAttachment}
                 />
@@ -7184,17 +10083,30 @@ export function App() {
                 >
                   <Plus size={18} />
                 </button>
-                <select
-                  className="composer-permission-select"
-                  value={permission}
-                  onChange={(event) => setPermission(normalizePermissionMode(event.target.value))}
-                  title="Permission"
-                >
-                  <option value="REQUEST_APPROVAL">请求批准</option>
-                  <option value="AUTO_APPROVE">替我审批</option>
-                  <option value="FULL_ACCESS">完全访问</option>
-                  <option value="READONLY">只读</option>
-                </select>
+                {durablePlan?.status === "planning" ? (
+                  <button
+                    className="composer-plan-mode"
+                    data-testid="composer-plan-readonly"
+                    onClick={() => openPlanPanel().catch((err: unknown) => setPlanError(userFacingErrorMessage(err)))}
+                    title="规划态由 Runtime 强制只读"
+                    type="button"
+                  >
+                    <ListChecks size={14} />
+                    计划只读
+                  </button>
+                ) : (
+                  <select
+                    className="composer-permission-select"
+                    value={permission}
+                    onChange={(event) => setPermission(normalizePermissionMode(event.target.value))}
+                    title="Permission"
+                  >
+                    <option value="REQUEST_APPROVAL">请求批准</option>
+                    <option value="AUTO_APPROVE">替我审批</option>
+                    <option value="FULL_ACCESS">完全访问</option>
+                    <option value="READONLY">只读</option>
+                  </select>
+                )}
                 {attachmentMenuOpen ? (
                   <div className="composer-attach-menu" role="menu">
                     <button onClick={() => chooseComposerAttachments("choose_attachment_files")} role="menuitem" type="button">
@@ -7208,6 +10120,22 @@ export function App() {
                     <button onClick={attachOpenAgentContext} role="menuitem" type="button">
                       <Bot size={15} />
                       <span>附加 OpenAgent</span>
+                    </button>
+                    <button
+                      onClick={() => openGoalPanel().catch((err: unknown) => setGoalError(userFacingErrorMessage(err)))}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <Target size={15} />
+                      <span>{durableGoal ? "查看目标" : "创建目标"}</span>
+                    </button>
+                    <button
+                      onClick={() => openPlanPanel().catch((err: unknown) => setPlanError(userFacingErrorMessage(err)))}
+                      role="menuitem"
+                      type="button"
+                    >
+                      <ListChecks size={15} />
+                      <span>{durablePlan ? "查看计划" : "计划模式"}</span>
                     </button>
                   </div>
                 ) : null}
@@ -7395,6 +10323,8 @@ export function App() {
             ) : null}
           </form>
         </div>
+          </>
+        )}
       </section>
 
       <button
@@ -7414,6 +10344,21 @@ export function App() {
             <PanelRight size={16} />
           </button>
         </div>
+        {sessionTaskCount || taskTreeError ? (
+          <TaskTreeInspector
+            actionBusy={taskActionBusy}
+            actionNotice={taskActionNotice}
+            busy={taskTreeBusy}
+            error={taskTreeError}
+            onRefresh={() => {
+              refreshSessionTaskTree(activeSessionId).catch((err: unknown) => setTaskTreeError(userFacingErrorMessage(err)));
+            }}
+            onSelectTask={setSelectedSessionTaskId}
+            onTaskAction={runTaskLifecycleAction}
+            payload={sessionTaskTree}
+            selectedTaskId={selectedSessionTaskId}
+          />
+        ) : null}
                 <div className="inspector-card jobs-inspector-card" data-testid="jobs-inspector-card">
           <div className="inspector-title">
             <Activity size={15} />
@@ -7693,21 +10638,25 @@ export function App() {
                 {contextLatest?.rebuilt ? <span>已压缩重建</span> : null}
               </div>
               <div className="context-source-list" aria-label="Context source decisions">
-                {contextTrace.slice(0, 12).map((entry, index) => (
-                  <div
-                    className={`context-source-row ${entry.included ? "included" : "dropped"} ${entry.truncated ? "truncated" : ""}`}
-                    key={`${entry.kind ?? "context"}:${entry.source ?? "source"}:${index}`}
-                  >
-                    <span className="context-source-dot" />
-                    <div>
-                      <strong>{contextKindLabel(entry.kind)}</strong>
-                      <small title={entry.source}>{entry.source || "runtime"}</small>
+                {contextTrace.slice(0, 12).map((entry, index) => {
+                  const attachmentName = entry.attachment?.name || "";
+                  return (
+                    <div
+                      className={`context-source-row ${entry.included ? "included" : "dropped"} ${entry.truncated ? "truncated" : ""}`}
+                      data-attachment-kind={entry.attachment?.kind || ""}
+                      key={`${entry.kind ?? "context"}:${entry.source ?? "source"}:${index}`}
+                    >
+                      <span className="context-source-dot" />
+                      <div>
+                        <strong>{attachmentName || contextKindLabel(entry.kind)}</strong>
+                        <small title={entry.source}>{contextAttachmentDetail(entry)}</small>
+                      </div>
+                      <span>
+                        {contextDecisionLabel(entry)} · {formatContextTokens(entry.token_estimate)} tok
+                      </span>
                     </div>
-                    <span>
-                      {contextDecisionLabel(entry)} · {formatContextTokens(entry.token_estimate)} tok
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
               {contextTrace.length > 12 ? (
                 <p className="muted-line">另有 {contextTrace.length - 12} 个来源，可从诊断 API 获取完整列表。</p>
@@ -7940,6 +10889,7 @@ function toolCallStatusLabel(status: string): string {
 
 function processEventTitle(event: AppEvent): string {
   const method = event.method;
+  if (method === "turn/retried") return "已恢复任务";
   if (method === "turn/retrying") return "模型请求重试";
   if (method === "turn/fallback") return "已切换备用模型";
   if (method === "item/agentMessage/thinking") return "正在思考";
@@ -7967,6 +10917,11 @@ function processEventStatus(event: AppEvent): string {
 
 function processEventSummary(event: AppEvent): string {
   const params = event.params ?? {};
+  if (event.method === "turn/retried") {
+    const retryCount = Number(params.retry_count ?? 0);
+    const maxRetries = Number(params.max_retries ?? 0);
+    return `第 ${retryCount || "?"}/${maxRetries || "?"} 次恢复`;
+  }
   if (event.method === "turn/retrying") {
     const attempt = Number(params.attempt ?? 0);
     const maxAttempts = Number(params.max_attempts ?? 0);
@@ -8012,18 +10967,22 @@ function EventContent({ event }: { event: AppEvent }) {
   const params = event.params ?? {};
   const status = processEventStatus(event);
   const isTerminalFailure = event.method === "turn/failed" || event.method === "turn/interrupted";
-  const isProviderRecovery = event.method === "turn/retrying" || event.method === "turn/fallback";
+  const isProviderRecovery = event.method === "turn/retried" || event.method === "turn/retrying" || event.method === "turn/fallback";
   const friendlyTitle =
     event.method === "turn/interrupted"
       ? "任务已停止"
       : event.method === "turn/failed"
         ? "模型请求未完成"
+        : event.method === "turn/retried"
+          ? "任务已从失败点恢复"
         : event.method === "turn/retrying"
           ? "正在重试模型请求"
           : "备用模型继续执行";
   const friendlyHint =
     event.method === "turn/failed"
       ? "可以重试任务，或前往 Settings → 配置验证当前 Provider。"
+      : event.method === "turn/retried"
+        ? "沿用原会话上下文继续执行，不会重复写入你的问题。"
       : event.method === "turn/retrying"
         ? "Runtime 会在短暂等待后自动继续。"
         : event.method === "turn/fallback"
@@ -8100,6 +11059,58 @@ function LiveTurnProcessCard({ events, isStreaming }: { events: AppEvent[]; isSt
   );
 }
 
+function finalResultItemLabel(item: FinalResultItem, section: "changed" | "verified" | "remaining"): string {
+  if (item.path) {
+    const status =
+      item.status === "added"
+        ? "新增"
+        : item.status === "deleted"
+          ? "删除"
+          : item.status === "modified"
+            ? "修改"
+            : "变更";
+    return `${status} ${item.path}`;
+  }
+  if (item.tool) {
+    return section === "verified" ? `${item.tool} 已完成` : `${item.tool} ${item.status === "pending" ? "仍在等待" : "未完成"}`;
+  }
+  return item.label || "未命名结果";
+}
+
+function FinalResultCard({ result }: { result: FinalResult }) {
+  const sections = [
+    { id: "changed" as const, label: "changed", items: result.changed },
+    { id: "verified" as const, label: "verified", items: result.verified },
+    { id: "remaining" as const, label: "remaining", items: result.remaining },
+  ];
+  return (
+    <section
+      className="final-result-card"
+      data-run-id={result.runId || ""}
+      data-schema-version={result.schemaVersion || ""}
+      data-testid="final-result"
+    >
+      {sections.map((section) => (
+        <div className={`final-result-section final-result-${section.id}`} data-testid={`final-result-${section.id}`} key={section.id}>
+          <strong>{section.label}</strong>
+          {section.items.length ? (
+            <ul>
+              {section.items.map((item, index) => (
+                <li key={`${item.path || item.tool || item.label || section.id}:${index}`}>
+                  {section.id === "changed" ? <FileText size={14} /> : section.id === "verified" ? <CheckCircle2 size={14} /> : <Circle size={14} />}
+                  <span>{finalResultItemLabel(item, section.id)}</span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <span className="final-result-empty">无</span>
+          )}
+        </div>
+      ))}
+    </section>
+  );
+}
+
 function MessagePartCards({ parts }: { parts: MessagePart[] }) {
   if (parts.length === 0) return null;
   return (
@@ -8123,15 +11134,41 @@ function AttachmentChips({
     <div className="attachment-chips">
       {attachments.map((attachment, index) => {
         const id = attachment.id || `${attachment.path || attachment.name}:${index}`;
-        const title = attachment.path || attachment.name;
+        const media = attachment.mediaMetadata ?? {};
+        const width = numberField(media, "width_px");
+        const height = numberField(media, "height_px");
+        const typeLabel =
+          attachment.kind === "image"
+            ? "图片"
+            : attachment.kind === "pdf"
+              ? "PDF"
+              : attachment.kind === "document"
+                ? "文档"
+                : "文件";
+        const truncationLabel = attachment.truncated
+          ? attachment.includedContentBytes === 0
+            ? "仅元数据"
+            : "内容已截断"
+          : "";
+        const title = [attachment.path || attachment.name, attachment.truncationReason].filter(Boolean).join("\n");
         const detail = [
+          typeLabel,
           formatBytes(attachment.sizeBytes),
+          attachment.pageCount ? `${attachment.pageCount} 页` : "",
+          width && height ? `${width}×${height}` : "",
           attachment.contentLines ? `${attachment.contentLines} lines` : "",
+          truncationLabel,
         ]
           .filter(Boolean)
           .join(" · ");
         return (
-          <span className="attachment-chip" key={id} title={title}>
+          <span
+            className={`attachment-chip kind-${attachment.kind} ${attachment.truncated ? "truncated" : ""}`}
+            data-attachment-kind={attachment.kind}
+            data-truncated={attachment.truncated ? "true" : "false"}
+            key={id}
+            title={title}
+          >
             <FileText size={13} />
             <span>{attachment.name || attachmentName(attachment.path)}</span>
             {detail ? <small>{detail}</small> : null}

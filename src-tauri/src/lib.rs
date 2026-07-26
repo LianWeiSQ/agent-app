@@ -3,17 +3,18 @@ use std::{
     env,
     error::Error,
     fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tauri_plugin_shell::ShellExt;
 
 const DESKTOP_BRIDGE_CORS_ORIGINS: &str =
     "tauri://localhost,http://tauri.localhost,http://127.0.0.1:5173,http://localhost:5173";
@@ -70,6 +71,13 @@ struct DesktopAttachment {
     size_bytes: u64,
     content_type: String,
     content: String,
+    source: String,
+    page_count: Option<u64>,
+    media_metadata: BTreeMap<String, Value>,
+    truncated: bool,
+    truncation_reason: Option<String>,
+    original_content_bytes: Option<u64>,
+    included_content_bytes: Option<u64>,
     error: Option<String>,
 }
 
@@ -188,9 +196,22 @@ struct ProviderValidationResult {
     sample: Option<String>,
 }
 
-#[derive(Default)]
 struct BridgeProcess {
     child: Mutex<Option<ManagedBridgeChild>>,
+    last_start: Mutex<Option<BridgeStartOptions>>,
+    lifecycle: Mutex<BridgeLifecycle>,
+}
+
+#[derive(Debug)]
+struct BridgeLifecycle {
+    state: String,
+    generation: u64,
+    recovery_count: u32,
+    unexpected_exit_count: u32,
+    last_error: Option<String>,
+    last_exit_at_ms: Option<u64>,
+    recovered_at_ms: Option<u64>,
+    last_status: Option<BridgeStatus>,
 }
 
 struct ManagedBridgeChild {
@@ -205,7 +226,7 @@ struct ManagedBridgeChild {
     provider: ProviderEnvSummary,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeStartOptions {
     workspace: Option<String>,
@@ -215,7 +236,7 @@ struct BridgeStartOptions {
     auth_token: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct BridgeStatus {
     running: bool,
     pid: Option<u32>,
@@ -227,6 +248,31 @@ struct BridgeStatus {
     binary: Option<String>,
     provider: ProviderEnvSummary,
     error: Option<String>,
+    lifecycle: String,
+    generation: u64,
+    recovery_count: u32,
+    unexpected_exit_count: u32,
+    last_exit_at_ms: Option<u64>,
+    recovered_at_ms: Option<u64>,
+}
+
+impl Default for BridgeProcess {
+    fn default() -> Self {
+        Self {
+            child: Mutex::new(None),
+            last_start: Mutex::new(None),
+            lifecycle: Mutex::new(BridgeLifecycle {
+                state: "stopped".to_string(),
+                generation: 0,
+                recovery_count: 0,
+                unexpected_exit_count: 0,
+                last_error: None,
+                last_exit_at_ms: None,
+                recovered_at_ms: None,
+                last_status: None,
+            }),
+        }
+    }
 }
 
 impl BridgeProcess {
@@ -236,53 +282,141 @@ impl BridgeProcess {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if guard.is_none() {
-            return stopped_bridge_status(None);
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut status = lifecycle
+                .last_status
+                .clone()
+                .unwrap_or_else(|| stopped_bridge_status(None));
+            status.running = false;
+            status.pid = None;
+            apply_bridge_lifecycle(&mut status, &lifecycle);
+            return status;
         }
 
-        let exited_status = {
+        let exited = {
             let managed = guard.as_mut().expect("guard checked above");
             match managed.child.try_wait() {
-                Ok(None) => return managed.to_status(true, None),
-                Ok(Some(status)) => Some(managed.to_status(
-                    false,
-                    Some(format!("openagent-http-runtime exited with {status}")),
+                Ok(None) => {
+                    let mut status = managed.to_status(true, None);
+                    let lifecycle = self
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    apply_bridge_lifecycle(&mut status, &lifecycle);
+                    return status;
+                }
+                Ok(Some(status)) => Some((
+                    managed.to_status(false, None),
+                    format!("openagent-http-runtime exited with {status}"),
                 )),
                 Err(error) => {
-                    return managed.to_status(
-                        true,
-                        Some(format!("failed to inspect bridge process: {error}")),
-                    );
+                    let message = format!("failed to inspect bridge process: {error}");
+                    let mut status = managed.to_status(true, Some(message.clone()));
+                    let mut lifecycle = self
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    lifecycle.last_error = Some(message);
+                    apply_bridge_lifecycle(&mut status, &lifecycle);
+                    lifecycle.last_status = Some(status.clone());
+                    return status;
                 }
             }
         };
         *guard = None;
-        exited_status.unwrap_or_else(|| stopped_bridge_status(None))
+        let Some((mut status, message)) = exited else {
+            return stopped_bridge_status(None);
+        };
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.state = "failed".to_string();
+        lifecycle.unexpected_exit_count = lifecycle.unexpected_exit_count.saturating_add(1);
+        lifecycle.last_error = Some(message.clone());
+        lifecycle.last_exit_at_ms = Some(unix_time_ms());
+        status.pid = None;
+        status.error = Some(message);
+        apply_bridge_lifecycle(&mut status, &lifecycle);
+        lifecycle.last_status = Some(status.clone());
+        status
     }
 
     fn start(&self, options: BridgeStartOptions) -> Result<BridgeStatus, String> {
+        self.start_with_mode(options, false)
+    }
+
+    fn start_with_mode(
+        &self,
+        options: BridgeStartOptions,
+        recovering: bool,
+    ) -> Result<BridgeStatus, String> {
+        let current = self.status();
+        if current.running {
+            return Ok(current);
+        }
+        {
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.state = if recovering { "recovering" } else { "starting" }.to_string();
+            lifecycle.last_error = None;
+        }
+
+        let result = self.spawn_bridge(&options);
+        match result {
+            Ok(managed) => {
+                let mut status = managed.to_status(true, None);
+                {
+                    let mut guard = self
+                        .child
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    *guard = Some(managed);
+                }
+                *self
+                    .last_start
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(options);
+                let mut lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                lifecycle.state = "running".to_string();
+                lifecycle.generation = lifecycle.generation.saturating_add(1);
+                lifecycle.last_error = None;
+                if recovering {
+                    lifecycle.recovery_count = lifecycle.recovery_count.saturating_add(1);
+                    lifecycle.recovered_at_ms = Some(unix_time_ms());
+                }
+                apply_bridge_lifecycle(&mut status, &lifecycle);
+                lifecycle.last_status = Some(status.clone());
+                Ok(status)
+            }
+            Err(error) => {
+                let mut lifecycle = self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                lifecycle.state = "failed".to_string();
+                lifecycle.last_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn spawn_bridge(&self, options: &BridgeStartOptions) -> Result<ManagedBridgeChild, String> {
         let mut guard = self
             .child
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.is_some() {
-            let already_running = {
-                let managed = guard.as_mut().expect("guard checked above");
-                match managed.child.try_wait() {
-                    Ok(None) => Some(managed.to_status(true, None)),
-                    Ok(Some(_)) => None,
-                    Err(error) => Some(managed.to_status(
-                        true,
-                        Some(format!("failed to inspect bridge process: {error}")),
-                    )),
-                }
-            };
-            if let Some(status) = already_running {
-                return Ok(status);
-            }
-            *guard = None;
-        }
+        *guard = None;
 
-        let core_root = core_workspace_root_from_option(options.core_root);
+        let core_root = core_workspace_root_from_option(options.core_root.clone());
         let binary = find_bridge_binary(&core_root).ok_or_else(|| {
             format!(
                 "openagent-http-runtime not found for harness root `{}`. Build it with `cargo build --manifest-path {}/Cargo.toml -p openagent-http-runtime` or set OPENAGENT_HTTP_RUNTIME.",
@@ -294,8 +428,8 @@ impl BridgeProcess {
         if port == 0 {
             return Err("bridge port must be greater than 0".to_string());
         }
-        let workspace = non_empty(options.workspace).unwrap_or_else(default_workspace);
-        let session_root = non_empty(options.session_root)
+        let workspace = non_empty(options.workspace.clone()).unwrap_or_else(default_workspace);
+        let session_root = non_empty(options.session_root.clone())
             .unwrap_or_else(|| default_session_root().display().to_string());
         fs::create_dir_all(&session_root)
             .map_err(|error| format!("failed to create session root `{session_root}`: {error}"))?;
@@ -303,7 +437,7 @@ impl BridgeProcess {
         let url = format!("http://127.0.0.1:{port}");
         let mut command = Command::new(&binary.path);
         let auth_token_path = desktop_auth_token_path();
-        if let Some(token) = non_empty(options.auth_token) {
+        if let Some(token) = non_empty(options.auth_token.clone()) {
             write_secret_file(&auth_token_path, &token)?;
         } else {
             let _ = desktop_auth_token()?;
@@ -339,7 +473,7 @@ impl BridgeProcess {
             .map_err(|error| format!("failed to start openagent-http-runtime: {error}"))?;
         wait_for_bridge_port(&mut child, port)?;
 
-        let managed = ManagedBridgeChild {
+        Ok(ManagedBridgeChild {
             pid: child.id(),
             child,
             url,
@@ -349,10 +483,7 @@ impl BridgeProcess {
             session_root,
             binary: binary.path,
             provider: provider_env.summary(),
-        };
-        let status = managed.to_status(true, None);
-        *guard = Some(managed);
-        Ok(status)
+        })
     }
 
     fn stop(&self) -> Result<BridgeStatus, String> {
@@ -361,14 +492,38 @@ impl BridgeProcess {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(mut managed) = guard.take() else {
-            return Ok(stopped_bridge_status(None));
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            lifecycle.state = "stopped".to_string();
+            lifecycle.last_error = None;
+            let mut status = lifecycle
+                .last_status
+                .clone()
+                .unwrap_or_else(|| stopped_bridge_status(None));
+            status.running = false;
+            status.pid = None;
+            status.error = None;
+            apply_bridge_lifecycle(&mut status, &lifecycle);
+            lifecycle.last_status = Some(status.clone());
+            return Ok(status);
         };
-        let status = managed.to_status(false, None);
+        let mut status = managed.to_status(false, None);
         let needs_kill = !matches!(managed.child.try_wait(), Ok(Some(_)));
         if needs_kill {
             let _ = managed.child.kill();
         }
         let _ = managed.child.wait();
+        status.pid = None;
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.state = "stopped".to_string();
+        lifecycle.last_error = None;
+        apply_bridge_lifecycle(&mut status, &lifecycle);
+        lifecycle.last_status = Some(status.clone());
         Ok(status)
     }
 
@@ -376,6 +531,30 @@ impl BridgeProcess {
         let _ = self.stop()?;
         thread::sleep(Duration::from_millis(80));
         self.start(options)
+    }
+
+    fn recover(
+        &self,
+        options: Option<BridgeStartOptions>,
+        restart_running: bool,
+    ) -> Result<BridgeStatus, String> {
+        let current = self.status();
+        if current.running && !restart_running {
+            return Ok(current);
+        }
+        let options = options
+            .or_else(|| {
+                self.last_start
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone()
+            })
+            .ok_or_else(|| "managed Bridge has no previous start configuration".to_string())?;
+        if current.running {
+            let _ = self.stop()?;
+            thread::sleep(Duration::from_millis(80));
+        }
+        self.start_with_mode(options, true)
     }
 }
 
@@ -403,6 +582,12 @@ impl ManagedBridgeChild {
             binary: Some(self.binary.clone()),
             provider: self.provider.clone(),
             error,
+            lifecycle: if running { "running" } else { "stopped" }.to_string(),
+            generation: 0,
+            recovery_count: 0,
+            unexpected_exit_count: 0,
+            last_exit_at_ms: None,
+            recovered_at_ms: None,
         }
     }
 }
@@ -1330,6 +1515,15 @@ fn bridge_restart(
 }
 
 #[tauri::command]
+fn bridge_recover(
+    options: Option<BridgeStartOptions>,
+    restart_running: Option<bool>,
+    state: tauri::State<'_, BridgeProcess>,
+) -> Result<BridgeStatus, String> {
+    state.recover(options, restart_running.unwrap_or(false))
+}
+
+#[tauri::command]
 fn provider_config_read(options: ProviderConfigOptions) -> ProviderConfigPayload {
     provider_config_payload(options)
 }
@@ -1396,7 +1590,7 @@ fn choose_attachment_files() -> Vec<DesktopAttachment> {
     paths
         .into_iter()
         .take(MAX_DESKTOP_ATTACHMENTS)
-        .map(|path| desktop_attachment_from_file(&path, true))
+        .map(|path| desktop_attachment_from_file(&path, true, "desktop_file_picker"))
         .collect()
 }
 
@@ -1426,13 +1620,37 @@ fn choose_attachment_folders() -> Vec<DesktopAttachment> {
             size_bytes: 0,
             content_type: "text/plain".to_string(),
             content: String::new(),
+            source: "desktop_folder_picker".to_string(),
+            page_count: None,
+            media_metadata: BTreeMap::new(),
+            truncated: false,
+            truncation_reason: None,
+            original_content_bytes: None,
+            included_content_bytes: None,
             error: Some("no readable text files found in selected folder".to_string()),
         });
     }
     attachments
 }
 
-fn desktop_attachment_from_file(path: &Path, report_read_errors: bool) -> DesktopAttachment {
+#[tauri::command]
+fn open_external_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://"))
+        || trimmed.contains(['\r', '\n'])
+    {
+        return Err("Only HTTP(S) URLs can be opened".to_string());
+    }
+    app.shell()
+        .open(trimmed.to_string(), None)
+        .map_err(|error| error.to_string())
+}
+
+fn desktop_attachment_from_file(
+    path: &Path,
+    report_read_errors: bool,
+    source: &str,
+) -> DesktopAttachment {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -1442,38 +1660,283 @@ fn desktop_attachment_from_file(path: &Path, report_read_errors: bool) -> Deskto
     let size_bytes = fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    if size_bytes > MAX_DESKTOP_ATTACHMENT_BYTES {
-        return DesktopAttachment {
-            kind: "file".to_string(),
-            path: path_text,
-            name,
-            size_bytes,
-            content_type: "text/plain".to_string(),
-            content: String::new(),
-            error: format!("file is larger than {} bytes", MAX_DESKTOP_ATTACHMENT_BYTES).into(),
-        };
+    let descriptor = desktop_attachment_descriptor(path);
+    let mut media_metadata = BTreeMap::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        media_metadata.insert(
+            "extension".to_string(),
+            json!(extension.to_ascii_lowercase()),
+        );
+    }
+    let page_count = (descriptor.kind == "pdf")
+        .then(|| pdf_page_count(path).ok())
+        .flatten()
+        .filter(|count| *count > 0);
+    if descriptor.kind == "image" {
+        if let Ok(Some((width, height))) = image_dimensions(path) {
+            media_metadata.insert("width_px".to_string(), json!(width));
+            media_metadata.insert("height_px".to_string(), json!(height));
+        }
     }
 
-    match fs::read_to_string(path) {
-        Ok(content) => DesktopAttachment {
-            kind: "file".to_string(),
-            path: path_text,
-            name,
-            size_bytes,
-            content_type: "text/plain".to_string(),
-            content,
-            error: None,
+    let (content, truncated, truncation_reason, included_content_bytes, read_error) =
+        if descriptor.text {
+            match read_desktop_attachment_text(path, size_bytes) {
+                Ok((content, truncated)) => {
+                    let included = content.len() as u64;
+                    (
+                        content,
+                        truncated,
+                        truncated.then(|| "desktop_attachment_content_limit".to_string()),
+                        Some(included),
+                        None,
+                    )
+                }
+                Err(error) => (
+                    String::new(),
+                    true,
+                    Some("binary_content_not_embedded".to_string()),
+                    Some(0),
+                    report_read_errors.then(|| format!("failed to read text content: {error}")),
+                ),
+            }
+        } else {
+            let reason = match descriptor.kind {
+                "image" => "image_binary_metadata_only",
+                "pdf" => "pdf_binary_metadata_only",
+                "document" => "binary_document_metadata_only",
+                _ => "binary_content_not_embedded",
+            };
+            (String::new(), true, Some(reason.to_string()), Some(0), None)
+        };
+
+    DesktopAttachment {
+        kind: descriptor.kind.to_string(),
+        path: path_text,
+        name,
+        size_bytes,
+        content_type: descriptor.content_type.to_string(),
+        content,
+        source: source.to_string(),
+        page_count,
+        media_metadata,
+        truncated,
+        truncation_reason,
+        original_content_bytes: Some(size_bytes),
+        included_content_bytes,
+        error: read_error,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DesktopAttachmentDescriptor {
+    kind: &'static str,
+    content_type: &'static str,
+    text: bool,
+}
+
+fn desktop_attachment_descriptor(path: &Path) -> DesktopAttachmentDescriptor {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => DesktopAttachmentDescriptor {
+            kind: "image",
+            content_type: "image/png",
+            text: false,
         },
-        Err(error) => DesktopAttachment {
-            kind: "file".to_string(),
-            path: path_text,
-            name,
-            size_bytes,
-            content_type: "text/plain".to_string(),
-            content: String::new(),
-            error: report_read_errors.then(|| format!("failed to read text file: {error}")),
+        "jpg" | "jpeg" => DesktopAttachmentDescriptor {
+            kind: "image",
+            content_type: "image/jpeg",
+            text: false,
+        },
+        "gif" => DesktopAttachmentDescriptor {
+            kind: "image",
+            content_type: "image/gif",
+            text: false,
+        },
+        "webp" => DesktopAttachmentDescriptor {
+            kind: "image",
+            content_type: "image/webp",
+            text: false,
+        },
+        "svg" => DesktopAttachmentDescriptor {
+            kind: "image",
+            content_type: "image/svg+xml",
+            text: true,
+        },
+        "pdf" => DesktopAttachmentDescriptor {
+            kind: "pdf",
+            content_type: "application/pdf",
+            text: false,
+        },
+        "doc" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/msword",
+            text: false,
+        },
+        "docx" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            text: false,
+        },
+        "odt" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/vnd.oasis.opendocument.text",
+            text: false,
+        },
+        "rtf" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/rtf",
+            text: true,
+        },
+        "md" | "markdown" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "text/markdown",
+            text: true,
+        },
+        "txt" | "log" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "text/plain",
+            text: true,
+        },
+        "csv" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "text/csv",
+            text: true,
+        },
+        "json" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/json",
+            text: true,
+        },
+        "xml" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/xml",
+            text: true,
+        },
+        "yaml" | "yml" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/yaml",
+            text: true,
+        },
+        "toml" => DesktopAttachmentDescriptor {
+            kind: "document",
+            content_type: "application/toml",
+            text: true,
+        },
+        _ => DesktopAttachmentDescriptor {
+            kind: "file",
+            content_type: "text/plain",
+            text: true,
         },
     }
+}
+
+fn read_desktop_attachment_text(path: &Path, size_bytes: u64) -> Result<(String, bool), String> {
+    if size_bytes <= MAX_DESKTOP_ATTACHMENT_BYTES {
+        let bytes = fs::read(path).map_err(|error| error.to_string())?;
+        return String::from_utf8(bytes)
+            .map(|content| (content, false))
+            .map_err(|_| "content is not UTF-8 text".to_string());
+    }
+
+    const MARKER: &str = "\n\n[... attachment content truncated by OpenAgent Desktop ...]\n\n";
+    let retained = usize::try_from(MAX_DESKTOP_ATTACHMENT_BYTES)
+        .unwrap_or(256 * 1024)
+        .saturating_sub(MARKER.len());
+    let head_len = retained / 2;
+    let tail_len = retained.saturating_sub(head_len);
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut head = vec![0_u8; head_len];
+    file.read_exact(&mut head)
+        .map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::End(-(tail_len as i64)))
+        .map_err(|error| error.to_string())?;
+    let mut tail = vec![0_u8; tail_len];
+    file.read_exact(&mut tail)
+        .map_err(|error| error.to_string())?;
+    let head = String::from_utf8(head).map_err(|_| "content is not UTF-8 text".to_string())?;
+    let tail = String::from_utf8(tail).map_err(|_| "content is not UTF-8 text".to_string())?;
+    Ok((format!("{head}{MARKER}{tail}"), true))
+}
+
+fn pdf_page_count(path: &Path) -> Result<u64, String> {
+    const PATTERN: &[u8] = b"/Type /Page";
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut carry = Vec::new();
+    let mut pages = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let carry_len = carry.len();
+        carry.extend_from_slice(&buffer[..read]);
+        for (index, window) in carry.windows(PATTERN.len()).enumerate() {
+            if window == PATTERN
+                && index + PATTERN.len() > carry_len
+                && carry.get(index + PATTERN.len()).copied() != Some(b's')
+            {
+                pages += 1;
+            }
+        }
+        let keep = PATTERN.len().saturating_sub(1);
+        carry = carry[carry.len().saturating_sub(keep)..].to_vec();
+    }
+    Ok(pages)
+}
+
+fn image_dimensions(path: &Path) -> Result<Option<(u64, u64)>, String> {
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = vec![0_u8; 64 * 1024];
+    let read = file.read(&mut bytes).map_err(|error| error.to_string())?;
+    bytes.truncate(read);
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 24 {
+        return Ok(Some((
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap_or_default()) as u64,
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap_or_default()) as u64,
+        )));
+    }
+    if (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) && bytes.len() >= 10 {
+        return Ok(Some((
+            u16::from_le_bytes(bytes[6..8].try_into().unwrap_or_default()) as u64,
+            u16::from_le_bytes(bytes[8..10].try_into().unwrap_or_default()) as u64,
+        )));
+    }
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        let mut offset = 2_usize;
+        while offset + 9 < bytes.len() {
+            if bytes[offset] != 0xff {
+                offset += 1;
+                continue;
+            }
+            let marker = bytes[offset + 1];
+            offset += 2;
+            if marker == 0xd8 || marker == 0xd9 {
+                continue;
+            }
+            if offset + 2 > bytes.len() {
+                break;
+            }
+            let length = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]) as usize;
+            if length < 2 || offset + length > bytes.len() {
+                break;
+            }
+            if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf)
+                && length >= 7
+            {
+                let height = u16::from_be_bytes([bytes[offset + 3], bytes[offset + 4]]) as u64;
+                let width = u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]) as u64;
+                return Ok(Some((width, height)));
+            }
+            offset += length;
+        }
+    }
+    Ok(None)
 }
 
 fn collect_folder_attachments(
@@ -1519,7 +1982,7 @@ fn collect_folder_attachments(
                 *skipped += 1;
                 continue;
             }
-            let attachment = desktop_attachment_from_file(&path, false);
+            let attachment = desktop_attachment_from_file(&path, false, "desktop_folder_picker");
             if attachment.error.is_some() {
                 *skipped += 1;
                 continue;
@@ -1719,7 +2182,32 @@ fn stopped_bridge_status(error: Option<String>) -> BridgeStatus {
         binary: find_bridge_binary(&core_root).map(|binary| binary.path),
         provider: provider_env_config(&workspace, &core_root).summary(),
         error,
+        lifecycle: "stopped".to_string(),
+        generation: 0,
+        recovery_count: 0,
+        unexpected_exit_count: 0,
+        last_exit_at_ms: None,
+        recovered_at_ms: None,
     }
+}
+
+fn apply_bridge_lifecycle(status: &mut BridgeStatus, lifecycle: &BridgeLifecycle) {
+    status.lifecycle.clone_from(&lifecycle.state);
+    status.generation = lifecycle.generation;
+    status.recovery_count = lifecycle.recovery_count;
+    status.unexpected_exit_count = lifecycle.unexpected_exit_count;
+    status.last_exit_at_ms = lifecycle.last_exit_at_ms;
+    status.recovered_at_ms = lifecycle.recovered_at_ms;
+    if status.error.is_none() {
+        status.error.clone_from(&lifecycle.last_error);
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn default_bridge_url() -> String {
@@ -1876,6 +2364,7 @@ pub fn run() {
             bridge_start,
             bridge_stop,
             bridge_restart,
+            bridge_recover,
             provider_config_read,
             provider_config_apply,
             provider_config_validate,
@@ -1883,7 +2372,8 @@ pub fn run() {
             project_path_info,
             choose_project_folder,
             choose_attachment_files,
-            choose_attachment_folders
+            choose_attachment_folders,
+            open_external_url
         ])
         .run(tauri::generate_context!())
         .expect("failed to run OpenAgent Desktop");
@@ -1989,6 +2479,61 @@ mod tests {
             .iter()
             .any(|attachment| attachment.content.contains("# Hello")));
         assert!(skipped >= 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rich_attachments_preserve_type_metadata_and_large_text_truncation() {
+        let root = temp_root("openagent-desktop-rich-attachments");
+        fs::create_dir_all(&root).expect("root");
+        let markdown = root.join("large.md");
+        fs::write(&markdown, "context line\n".repeat(30_000)).expect("large markdown");
+
+        let png = root.join("design.png");
+        let mut png_bytes = vec![0_u8; 24];
+        png_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        png_bytes[16..20].copy_from_slice(&1440_u32.to_be_bytes());
+        png_bytes[20..24].copy_from_slice(&900_u32.to_be_bytes());
+        fs::write(&png, png_bytes).expect("png");
+
+        let pdf = root.join("spec.pdf");
+        fs::write(
+            &pdf,
+            b"%PDF-1.7\n1 0 obj << /Type /Page >>\n2 0 obj << /Type /Pages /Count 2 >>\n3 0 obj << /Type /Page >>\n",
+        )
+        .expect("pdf");
+
+        let large = desktop_attachment_from_file(&markdown, true, "desktop_file_picker");
+        assert_eq!(large.kind, "document");
+        assert_eq!(large.content_type, "text/markdown");
+        assert!(large.truncated);
+        assert_eq!(
+            large.truncation_reason.as_deref(),
+            Some("desktop_attachment_content_limit")
+        );
+        assert!(large.content.contains("attachment content truncated"));
+        assert!(large.included_content_bytes.unwrap_or_default() <= MAX_DESKTOP_ATTACHMENT_BYTES);
+
+        let image = desktop_attachment_from_file(&png, true, "desktop_file_picker");
+        assert_eq!(image.kind, "image");
+        assert_eq!(image.content_type, "image/png");
+        assert_eq!(image.media_metadata["width_px"], json!(1440));
+        assert_eq!(image.media_metadata["height_px"], json!(900));
+        assert_eq!(image.content, "");
+        assert_eq!(
+            image.truncation_reason.as_deref(),
+            Some("image_binary_metadata_only")
+        );
+
+        let document = desktop_attachment_from_file(&pdf, true, "desktop_file_picker");
+        assert_eq!(document.kind, "pdf");
+        assert_eq!(document.page_count, Some(2));
+        assert_eq!(document.content, "");
+        assert_eq!(
+            document.truncation_reason.as_deref(),
+            Some("pdf_binary_metadata_only")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -2128,6 +2673,40 @@ mod tests {
         assert!(authorized_after_restart.contains("200 OK"));
         assert!(authorized_after_restart.contains("\"ok\""));
         assert!(authorized_after_restart.contains("true"));
+
+        {
+            let mut guard = process
+                .child
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let managed = guard.as_mut().expect("managed bridge child");
+            managed.child.kill().expect("kill managed bridge");
+            managed.child.wait().expect("wait for killed bridge");
+        }
+        let crashed = process.status();
+        assert!(!crashed.running);
+        assert_eq!(crashed.lifecycle, "failed");
+        assert_eq!(crashed.unexpected_exit_count, 1);
+        assert!(crashed.last_exit_at_ms.is_some());
+        assert!(crashed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("exited"));
+
+        let recovered = process
+            .recover(None, false)
+            .expect("recover managed bridge");
+        assert!(recovered.running);
+        assert_eq!(recovered.lifecycle, "running");
+        assert_eq!(recovered.workspace, workspace_b.display().to_string());
+        assert_eq!(recovered.session_root, session_root.display().to_string());
+        assert_eq!(recovered.recovery_count, 1);
+        assert_eq!(recovered.unexpected_exit_count, 1);
+        assert!(recovered.recovered_at_ms.is_some());
+        let authorized_after_recovery =
+            http_get(port, "/api/health", Some(token)).expect("authorized health after recovery");
+        assert!(authorized_after_recovery.contains("200 OK"));
 
         let stopped = process.stop().expect("stop bridge");
         assert!(!stopped.running);

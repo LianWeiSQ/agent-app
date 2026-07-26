@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -11,7 +11,7 @@ import { chromium } from "playwright";
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const desktopDir = path.resolve(scriptDir, "..");
-const repoRoot = path.resolve(desktopDir, "..");
+const repoRoot = path.resolve(process.env.OPENAGENT_CORE_ROOT || path.join(desktopDir, "..", "openharness"));
 const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const token = "desktop-checkpoint-restore-smoke-token";
 
@@ -127,13 +127,9 @@ function startModelsProvider(port) {
   });
 }
 
-async function waitForPageState(page, predicate, arg, timeoutMs = 15_000) {
-  await page.waitForFunction(predicate, arg, { timeout: timeoutMs });
-}
-
 async function selectSmokeSession(page) {
   await page.locator(".composer").waitFor({ state: "visible", timeout: 15_000 });
-  const sessionRow = page.locator(".session-row").filter({ hasText: "Desktop checkpoint restore smoke" }).first();
+  const sessionRow = page.locator(".project-session-button").filter({ hasText: "Desktop checkpoint restore smoke" }).first();
   await sessionRow.waitFor({ state: "visible", timeout: 15_000 });
   await sessionRow.click();
 }
@@ -144,6 +140,15 @@ async function main() {
   const sessionRoot = path.join(tempRoot, "sessions");
   fs.mkdirSync(workspace, { recursive: true });
   fs.mkdirSync(sessionRoot, { recursive: true });
+  for (const args of [
+    ["init", "-q"],
+    ["config", "user.email", "openagent-smoke@example.invalid"],
+    ["config", "user.name", "OpenAgent Smoke"],
+    ["commit", "--allow-empty", "-q", "-m", "baseline"],
+  ]) {
+    const result = spawnSync("git", ["-C", workspace, ...args], { encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")} failed: ${result.stderr}`);
+  }
   const tokenPath = path.join(tempRoot, "bridge-auth-token");
   fs.writeFileSync(tokenPath, `${token}\n`, { mode: 0o600 });
 
@@ -205,25 +210,54 @@ async function main() {
     assert.ok(sessionId, "session id missing");
 
     const writeFile = path.join(workspace, "checkpoint-ui.txt");
+    const keepFile = path.join(workspace, "keep-ui.txt");
+    const manualFile = path.join(workspace, "manual-ui.txt");
     const turn = await bridgeJson(runtimePort, "POST", `/api/sessions/${sessionId}/turns`, {
-      input: "Create checkpoint-ui.txt so the Desktop review panel can restore it.",
+      input: "Create two files so the Desktop review panel can restore one file or the whole turn.",
       permission: "FULL",
-      tool_call: {
-        call_id: "call_checkpoint_restore_ui",
-        name: "write",
-        input: { file_path: "checkpoint-ui.txt", content: "checkpoint restore ui smoke\n" },
-      },
+      tool_calls: [
+        {
+          call_id: "call_checkpoint_restore_ui",
+          name: "write",
+          input: { file_path: "checkpoint-ui.txt", content: "checkpoint restore ui smoke\n" },
+        },
+        {
+          call_id: "call_keep_restore_ui",
+          name: "write",
+          input: { file_path: "keep-ui.txt", content: "keep after selected undo\n" },
+        },
+      ],
     });
     assert.ok(["completed", "running"].includes(turn.status), `write turn did not run: ${JSON.stringify(turn)}`);
 
     await waitForJson("checkpoint file write", () => {
-      if (!fs.existsSync(writeFile)) return null;
+      if (!fs.existsSync(writeFile) || !fs.existsSync(keepFile)) return null;
       const content = fs.readFileSync(writeFile, "utf8");
-      return content.includes("checkpoint restore ui smoke") ? { content } : null;
+      const kept = fs.readFileSync(keepFile, "utf8");
+      return content.includes("checkpoint restore ui smoke") && kept.includes("keep after selected undo")
+        ? { content, kept }
+        : null;
     });
+    const transcript = await bridgeJson(runtimePort, "GET", `/api/sessions/${sessionId}/messages?limit=20`);
+    const assistantMessages = (transcript.messages_v2 || []).filter((message) => message.info?.role === "assistant");
+    const resultPart = assistantMessages
+      .flatMap((message) => message.parts || [])
+      .find((part) => part.kind === "result");
+    assert.ok(resultPart, `final result part missing: ${JSON.stringify(transcript)}`);
+    assert.deepEqual(
+      resultPart.content.changed.map((item) => item.path).sort(),
+      ["checkpoint-ui.txt", "keep-ui.txt"],
+      "final result did not summarize both changed files",
+    );
+    assert.equal(resultPart.content.verified.filter((item) => item.tool === "write").length, 2);
+    assert.deepEqual(resultPart.content.remaining, []);
+    fs.writeFileSync(manualFile, "manual workspace change\n");
 
     const diff = await bridgeJson(runtimePort, "GET", `/api/sessions/${sessionId}/diff`);
     assert.ok(JSON.stringify(diff).includes("checkpoint-ui.txt"), `diff did not include checkpoint-ui.txt: ${JSON.stringify(diff)}`);
+    const manualGit = await bridgeJson(runtimePort, "GET", "/api/git?path=manual-ui.txt");
+    assert.equal(manualGit.selected_diff?.source, "untracked", `manual diff source missing: ${JSON.stringify(manualGit)}`);
+    assert.ok(manualGit.selected_diff?.diff?.includes("+manual workspace change"), "manual Git diff was not rendered");
     const checkpoints = await bridgeJson(runtimePort, "GET", `/api/sessions/${sessionId}/checkpoints`);
     const checkpointList = Array.isArray(checkpoints.checkpoints) ? checkpoints.checkpoints : [];
     assert.ok(checkpointList.length > 0, "expected checkpoints");
@@ -271,49 +305,78 @@ async function main() {
     await page.goto(`http://127.0.0.1:${vitePort}/`, { waitUntil: "domcontentloaded" });
     phase = "initial-load";
     await selectSmokeSession(page);
-    await page.locator('[data-testid="diff-dock-item"]').filter({ hasText: "checkpoint-ui.txt" }).waitFor({
+    const finalResult = page.locator('[data-testid="final-result"]').last();
+    await finalResult.waitFor({ state: "visible", timeout: 15_000 });
+    const finalResultText = await finalResult.textContent();
+    assert.ok(finalResultText.includes("changed"), `changed result section missing: ${finalResultText}`);
+    assert.ok(finalResultText.includes("checkpoint-ui.txt"), `changed file missing from result: ${finalResultText}`);
+    assert.ok(finalResultText.includes("keep-ui.txt"), `second changed file missing from result: ${finalResultText}`);
+    assert.ok(finalResultText.includes("verified"), `verified result section missing: ${finalResultText}`);
+    assert.ok(finalResultText.includes("write 已完成"), `tool evidence missing from result: ${finalResultText}`);
+    assert.ok(finalResultText.includes("remaining"), `remaining result section missing: ${finalResultText}`);
+    await page.locator('[data-testid="diff-dock-item"]').filter({ hasText: "keep-ui.txt" }).waitFor({
       state: "visible",
       timeout: 15_000,
     });
-    await page.locator('[data-testid="checkpoint-dock-item"]').waitFor({ state: "visible", timeout: 15_000 });
 
     phase = "review-restore";
-    await page.locator('[data-testid="diff-dock-item"]').filter({ hasText: "checkpoint-ui.txt" }).click();
+    await page.locator('[data-testid="diff-dock-item"]').filter({ hasText: "keep-ui.txt" }).click();
     await page.locator('[data-testid="review-panel"]').waitFor({ state: "visible", timeout: 15_000 });
     await page.locator('[data-testid="change-review-card"]').filter({ hasText: "checkpoint-ui.txt" }).waitFor({
       state: "visible",
       timeout: 15_000,
     });
-    await page.locator(`[data-testid="review-checkpoint-restore"][data-checkpoint-id="${checkpointId}"]`).click();
-    await waitForJson("checkpoint restore file removal", () => (!fs.existsSync(writeFile) ? { exists: false } : null));
-    await waitForPageState(
-      page,
-      (id) =>
-        Boolean(document.querySelector(`[data-testid="checkpoint-restore-state"][data-checkpoint-id="${id}"]`)) &&
-        Boolean(document.querySelector(`[data-testid="review-checkpoint-row"][data-checkpoint-id="${id}"][data-checkpoint-restored="true"]`)) &&
-        Boolean(document.querySelector(`[data-testid="checkpoint-restore-history"][data-checkpoint-id="${id}"]`)),
-      checkpointId,
+    await page.locator('[data-testid="change-review-card"]').filter({ hasText: "manual-ui.txt" }).click();
+    await page.locator('[data-testid="review-diff"]').filter({ hasText: "manual workspace change" }).waitFor({
+      state: "visible",
+      timeout: 15_000,
+    });
+
+    phase = "review-decisions";
+    await page.getByRole("button", { name: "完成审查" }).click();
+    await page.locator('[data-testid="review-panel"]').waitFor({ state: "detached", timeout: 15_000 });
+    await waitForJson("accepted review decision", async () => {
+      const payload = await bridgeJson(runtimePort, "GET", "/api/sessions");
+      const session = (payload.sessions || []).find((item) => (item.session_id || item.id) === sessionId);
+      return session?.metadata?.change_review?.status === "accepted" ? session.metadata.change_review : null;
+    });
+
+    await page.locator('[data-testid="diff-dock-item"]').click();
+    await page.getByRole("button", { name: "要求修改" }).click();
+    await page.locator('[data-testid="review-panel"]').waitFor({ state: "detached", timeout: 15_000 });
+    await page.locator(".composer textarea").waitFor({ state: "visible", timeout: 15_000 });
+    assert.ok(
+      (await page.locator(".composer textarea").inputValue()).includes("请根据审查意见继续修改"),
+      "request changes did not prepare a follow-up prompt",
     );
+    await waitForJson("changes requested review decision", async () => {
+      const payload = await bridgeJson(runtimePort, "GET", "/api/sessions");
+      const session = (payload.sessions || []).find((item) => (item.session_id || item.id) === sessionId);
+      return session?.metadata?.change_review?.status === "changes_requested" ? session.metadata.change_review : null;
+    });
+
+    await page.locator('[data-testid="diff-dock-item"]').click();
+    phase = "review-restore";
+    await page.locator('[data-testid="change-review-card"]').filter({ hasText: "checkpoint-ui.txt" }).click();
+    await page.getByRole("button", { name: "撤销此文件" }).click();
+    await page.getByRole("button", { name: "确认撤销" }).click();
+    await waitForJson("selected file rollback", () =>
+      !fs.existsSync(writeFile) && fs.existsSync(keepFile) ? { selectedRemoved: true, otherPreserved: true } : null,
+    );
+    await page.locator(`[data-testid="review-restore-turn"][data-checkpoint-id="${checkpointId}"]`).click();
+    await waitForJson("checkpoint restore file removal", () =>
+      !fs.existsSync(writeFile) && !fs.existsSync(keepFile) ? { exists: false } : null,
+    );
+    await page.locator(`[data-testid="review-restore-turn"][data-checkpoint-id="${checkpointId}"]`).filter({ hasText: "已恢复" }).waitFor({
+      state: "visible",
+      timeout: 15_000,
+    });
 
     phase = "reload";
     await page.reload({ waitUntil: "domcontentloaded" });
     await selectSmokeSession(page);
-    await page.locator(`[data-testid="checkpoint-dock-item"][data-restored-checkpoint-id="${checkpointId}"]`).waitFor({
-      state: "visible",
-      timeout: 15_000,
-    });
-    await page.locator('[data-testid="checkpoint-dock-item"]').click();
-    await page.locator(`[data-testid="checkpoint-restore-state"][data-checkpoint-id="${checkpointId}"]`).waitFor({
-      state: "visible",
-      timeout: 15_000,
-    });
-    await page.locator(`[data-testid="review-checkpoint-row"][data-checkpoint-id="${checkpointId}"][data-checkpoint-restored="true"]`).waitFor({
-      state: "visible",
-      timeout: 15_000,
-    });
-    await page.locator(`[data-testid="checkpoint-restore-history"][data-checkpoint-id="${checkpointId}"]`).filter({
-      hasText: "Workspace restored",
-    }).first().waitFor({
+    await page.locator('[data-testid="diff-dock-item"]').click();
+    await page.locator(`[data-testid="review-restore-turn"][data-checkpoint-id="${checkpointId}"]`).filter({ hasText: "已恢复" }).waitFor({
       state: "visible",
       timeout: 15_000,
     });
@@ -321,24 +384,15 @@ async function main() {
     const pageState = await page.evaluate((id) => ({
       overlayVisible: Boolean(document.querySelector("vite-error-overlay")),
       bodyOverflow: Math.max(0, document.body.scrollWidth - window.innerWidth),
-      dockText: document.querySelector('[data-testid="checkpoint-dock-item"]')?.textContent || "",
-      restoreText: document.querySelector(`[data-testid="checkpoint-restore-state"][data-checkpoint-id="${id}"]`)?.textContent || "",
-      restoreHistoryText: [...document.querySelectorAll(`[data-testid="checkpoint-restore-history"][data-checkpoint-id="${id}"]`)]
-        .map((item) => item.textContent || "")
-        .join("\n"),
-      restoredRows: document.querySelectorAll(`[data-testid="review-checkpoint-row"][data-checkpoint-restored="true"]`).length,
+      restoreText: document.querySelector(`[data-testid="review-restore-turn"][data-checkpoint-id="${id}"]`)?.textContent || "",
+      reviewVisible: Boolean(document.querySelector('[data-testid="review-panel"]')),
+      checkpointCards: document.querySelectorAll('[data-testid="review-checkpoint-row"], [data-testid="checkpoint-restore-state"]').length,
     }), checkpointId);
     assert.equal(pageState.overlayVisible, false, "Vite overlay is visible");
     assert.equal(pageState.bodyOverflow, 0, `Horizontal overflow detected: ${pageState.bodyOverflow}`);
-    assert.ok(pageState.dockText.includes("Restored"), `dock did not show restored state: ${pageState.dockText}`);
-    assert.ok(pageState.restoreText.includes("Restored"), `review panel did not show restored state: ${pageState.restoreText}`);
-    assert.ok(
-      pageState.restoreHistoryText.includes("Workspace restored") &&
-        pageState.restoreHistoryText.includes("Restore run") &&
-        pageState.restoreHistoryText.includes("Files"),
-      `restore history did not show detail: ${pageState.restoreHistoryText}`,
-    );
-    assert.ok(pageState.restoredRows >= 1, `expected restored checkpoint row: ${JSON.stringify(pageState)}`);
+    assert.equal(pageState.reviewVisible, true, "change review workspace is not visible after reload");
+    assert.ok(pageState.restoreText.includes("已恢复"), `review workspace did not show restored state: ${pageState.restoreText}`);
+    assert.equal(pageState.checkpointCards, 0, "internal checkpoint cards leaked into the review workspace");
     assert.deepEqual(pageErrors, [], `page errors: ${pageErrors.join("\n")}`);
     assert.deepEqual(consoleIssues, [], `console issues: ${consoleIssues.join("\n")}`);
 
@@ -353,6 +407,8 @@ async function main() {
           session_id: sessionId,
           restore_checkpoint_id: checkpointId,
           file_after_restore_exists: fs.existsSync(writeFile),
+          other_file_after_restore_exists: fs.existsSync(keepFile),
+          manual_git_file_exists: fs.existsSync(manualFile),
           screenshot: screenshotPath,
         },
         null,
@@ -367,8 +423,8 @@ async function main() {
       page: page
         ? await page.evaluate(() => ({
             body: (document.body.textContent || "").slice(0, 4000),
-            restoreState: document.querySelector('[data-testid="checkpoint-restore-state"]')?.outerHTML || "",
-            dock: document.querySelector('[data-testid="checkpoint-dock-item"]')?.outerHTML || "",
+            restoreState: document.querySelector('[data-testid="review-restore-turn"]')?.outerHTML || "",
+            review: document.querySelector('[data-testid="review-panel"]')?.outerHTML?.slice(0, 2000) || "",
           })).catch((innerError) => ({ error: innerError instanceof Error ? innerError.message : String(innerError) }))
         : null,
     };
