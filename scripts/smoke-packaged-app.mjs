@@ -37,8 +37,8 @@ function parseArgs(argv) {
   }
   assert.ok(["direct", "launchservices"].includes(options.launch), "--launch must be direct or launchservices");
   assert.ok(
-    ["", "approval-rollback", "approval-dock", "real-streaming", "local-mcp-lifecycle"].includes(options.workflow),
-    "--workflow must be approval-rollback, approval-dock, real-streaming, or local-mcp-lifecycle",
+    ["", "approval-rollback", "approval-dock", "real-streaming", "local-mcp-lifecycle", "bridge-recovery"].includes(options.workflow),
+    "--workflow must be approval-rollback, approval-dock, real-streaming, local-mcp-lifecycle, or bridge-recovery",
   );
   return options;
 }
@@ -145,11 +145,40 @@ async function waitForHealth(port, token, timeoutMs = 30_000) {
   let lastError = "";
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/health`, {
-        headers: { authorization: `Bearer ${token}` },
+      const result = await new Promise((resolve, reject) => {
+        const request = http.request({
+          host: "127.0.0.1",
+          port,
+          path: "/api/health",
+          method: "GET",
+          agent: false,
+          headers: {
+            accept: "application/json",
+            authorization: `Bearer ${token}`,
+            connection: "close",
+          },
+        }, (response) => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", (chunk) => {
+            body += chunk;
+          });
+          response.on("end", () => {
+            let payload = {};
+            try {
+              payload = body ? JSON.parse(body) : {};
+            } catch {
+              payload = {};
+            }
+            resolve({ status: response.statusCode || 0, payload });
+          });
+        });
+        request.setTimeout(1_000, () => request.destroy(new Error("health probe timeout")));
+        request.on("error", reject);
+        request.end();
       });
-      if (response.ok) return response.json();
-      lastError = `HTTP ${response.status}`;
+      if (result.status >= 200 && result.status < 300) return result.payload;
+      lastError = `HTTP ${result.status}`;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }
@@ -160,6 +189,13 @@ async function waitForHealth(port, token, timeoutMs = 30_000) {
 
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function listenerPid(port) {
+  const { stdout } = await execFileAsync("lsof", ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-t"]);
+  const pid = Number(stdout.trim().split(/\s+/)[0]);
+  assert.ok(Number.isInteger(pid) && pid > 0, `listener pid missing for port ${port}`);
+  return pid;
 }
 
 async function bridgeJson(port, token, method, apiPath, body = undefined) {
@@ -1442,6 +1478,37 @@ async function runLocalMcpLifecycleWorkflow(port, token, workspace, localMcp) {
   };
 }
 
+async function runBridgeRecoveryWorkflow(port, token, workspace) {
+  const created = await bridgeJson(port, token, "POST", "/api/sessions", {
+    cwd: workspace,
+    title: "Bridge recovery smoke",
+  });
+  const sessionId = created.payload.session_id || created.payload.id;
+  assert.ok(sessionId, "bridge recovery session id missing");
+
+  await sleep(1_500);
+  const previousPid = await listenerPid(port);
+  process.kill(previousPid, "SIGKILL");
+  const health = await waitForHealth(port, token, 35_000);
+  assert.equal(health.ok, true);
+  const recoveredPid = await listenerPid(port);
+  assert.notEqual(recoveredPid, previousPid, "managed Bridge pid did not change after crash recovery");
+
+  const sessions = await bridgeJson(port, token, "GET", "/api/sessions");
+  const records = Array.isArray(sessions.payload.sessions) ? sessions.payload.sessions : [];
+  assert.ok(
+    records.some((session) => session.session_id === sessionId || session.id === sessionId),
+    "session was not restored from the same session root after Bridge recovery",
+  );
+  return {
+    session_id: sessionId,
+    previous_pid: previousPid,
+    recovered_pid: recoveredPid,
+    workspace,
+    session_restored: true,
+  };
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.launch === "launchservices" && process.platform !== "darwin") {
@@ -1544,6 +1611,8 @@ async function main() {
       workflowResult = await runRealStreamingWorkflow(port, token, workspace, providerSummary);
     } else if (options.workflow === "local-mcp-lifecycle") {
       workflowResult = await runLocalMcpLifecycleWorkflow(port, token, workspace, localMcpWorkflow);
+    } else if (options.workflow === "bridge-recovery") {
+      workflowResult = await runBridgeRecoveryWorkflow(port, token, workspace);
     }
     screenshotPath = await captureScreenshot(options.screenshot, options.appPath) || "";
 
