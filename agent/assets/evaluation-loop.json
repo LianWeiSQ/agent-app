@@ -1,0 +1,147 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "用评测推动下一次改动 · 方法说明",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "trial",
+      "label": "一次评测"
+    },
+    {
+      "id": "judgement",
+      "label": "判分与归因"
+    },
+    {
+      "id": "change",
+      "label": "版本改进"
+    }
+  ],
+  "mainPath": [
+    "task",
+    "environment",
+    "run",
+    "verify",
+    "diagnose",
+    "candidate",
+    "gate"
+  ],
+  "nodes": [
+    {
+      "id": "task",
+      "lane": "trial",
+      "col": 0,
+      "type": "database",
+      "label": "固定任务与标准",
+      "sublabel": "输入 · 验证器 · 预算",
+      "width": 148
+    },
+    {
+      "id": "environment",
+      "lane": "trial",
+      "col": 1,
+      "type": "cloud",
+      "label": "隔离试验环境",
+      "sublabel": "版本 · 依赖 · 权限",
+      "width": 148
+    },
+    {
+      "id": "run",
+      "lane": "trial",
+      "col": 2,
+      "type": "backend",
+      "label": "被测 Agent 执行",
+      "sublabel": "保留轨迹与产物",
+      "width": 148
+    },
+    {
+      "id": "verify",
+      "lane": "judgement",
+      "col": 2,
+      "type": "security",
+      "label": "验证最终结果",
+      "sublabel": "客观判分与过程分析分开",
+      "width": 148
+    },
+    {
+      "id": "diagnose",
+      "lane": "judgement",
+      "col": 3,
+      "type": "backend",
+      "label": "找到失败原因",
+      "sublabel": "环境 · 协议 · 策略 · 产物",
+      "width": 148
+    },
+    {
+      "id": "candidate",
+      "lane": "change",
+      "col": 3,
+      "type": "backend",
+      "label": "形成小范围改动",
+      "sublabel": "每次检验一个主要假设",
+      "width": 148
+    },
+    {
+      "id": "gate",
+      "lane": "change",
+      "col": 4,
+      "type": "security",
+      "label": "回归与人工决策",
+      "sublabel": "保留 · 回退 · 证据不足",
+      "width": 148
+    }
+  ],
+  "edges": [
+    {
+      "from": "task",
+      "to": "environment",
+      "label": "准备"
+    },
+    {
+      "from": "environment",
+      "to": "run",
+      "label": "环境就绪"
+    },
+    {
+      "from": "run",
+      "to": "verify",
+      "label": "收集结果"
+    },
+    {
+      "from": "verify",
+      "to": "diagnose",
+      "label": "按证据归因"
+    },
+    {
+      "from": "diagnose",
+      "to": "candidate",
+      "label": "提出假设"
+    },
+    {
+      "from": "candidate",
+      "to": "gate",
+      "label": "重复对照"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "已陈述的实践",
+      "items": [
+        "搭建 Harbor 评测并运行过任务；源文记录的是本地 Docker 样本。",
+        "环境准备失败与任务能力失败分开统计，均保留记录。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "后半程是方法，不是既有收益",
+      "items": [
+        "留出任务、安全门禁和人工审阅约束候选晋级。",
+        "自动 RSI 尚属研究方向；本图不证明已获得稳定提升。"
+      ]
+    }
+  ]
+}

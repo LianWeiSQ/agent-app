@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "id": "task-delivery",
+      "kind": "illustration",
+      "sources": [
+        "src-feishu-interview",
+        "src-feishu-project-story"
+      ],
+      "purpose": "解释产品任务从受理、执行到文件交付的跨层关系。",
+      "files": [
+        {
+          "path": "agent/assets/task-delivery.json",
+          "sha256": "ffea064175854a3c860cbc1d5cbd7715dd2e9149124c14ede81b52352cb5e31b",
+          "bytes": 3526
+        },
+        {
+          "path": "agent/assets/task-delivery.html",
+          "sha256": "af975cf68f523c5c9f18f77529742df8c601b322a1f1c7b247b49826aaeaf4d5",
+          "bytes": 711838
+        },
+        {
+          "path": "agent/assets/task-delivery.visual-check.2048x1320.light.png",
+          "sha256": "79b5c47147501c87e302c0a18a05cc3e5a14e2d047182c2eb0223b792f553ca5",
+          "bytes": 172040
+        }
+      ],
+      "created": "2026-10-08",
+      "origin": "依据已读取材料重新绘制，Archify 2.17 渲染；非原始产品截图。",
+      "public_scope": "仅包含抽象流程，无内部部署、地址、权限缺口或用户数据。",
+      "checks": {
+        "diagram_type": "workflow",
+        "output": "agent/assets/task-delivery.html",
+        "specification_sha256": "ffea064175854a3c860cbc1d5cbd7715dd2e9149124c14ede81b52352cb5e31b",
+        "artifact_sha256": "af975cf68f523c5c9f18f77529742df8c601b322a1f1c7b247b49826aaeaf4d5",
+        "validation": "9/9 showcase, 0 errors, 0 warnings",
+        "browser_evidence": "passed",
+        "viewports": [
+          [
+            1440,
+            900
+          ],
+          [
+            1600,
+            1000
+          ],
+          [
+            1920,
+            1080
+          ],
+          [
+            2048,
+            1320
+          ]
+        ],
+        "visual_review": "passed",
+        "review_scope": "已查看 2048×1320 浅色与 1440×900 深色截图；节点、标签与关系无截断或遮挡。",
+        "correction_rounds": 2
+      }
+    },
+    {
+      "id": "evaluation-loop",
+      "kind": "illustration",
+      "sources": [
+        "src-feishu-interview"
+      ],
+      "purpose": "区分单次评测和后续候选改进；不把 RSI 方案写成已获得收益。",
+      "files": [
+        {
+          "path": "agent/assets/evaluation-loop.json",
+          "sha256": "d48a9e39976a1971a52d10e6862f8c20451ea63b7eda92f1b0499635b1f5e549",
+          "bytes": 3141
+        },
+        {
+          "path": "agent/assets/evaluation-loop.html",
+          "sha256": "855d3af801b8b581b2082ac11a7779be14399c6c193668da21c01154ed257714",
+          "bytes": 708925
+        },
+        {
+          "path": "agent/assets/evaluation-loop.visual-check.2048x1320.light.png",
+          "sha256": "388dbd11ac6f733b50dd624d427c3db7db28db75748d1f9464ae0590daeb706f",
+          "bytes": 175703
+        }
+      ],
+      "created": "2026-10-08",
+      "origin": "依据已读取材料重新绘制，Archify 2.17 渲染；非原始产品截图。",
+      "public_scope": "仅包含抽象流程，无内部部署、地址、权限缺口或用户数据。",
+      "checks": {
+        "diagram_type": "workflow",
+        "output": "agent/assets/evaluation-loop.html",
+        "specification_sha256": "d48a9e39976a1971a52d10e6862f8c20451ea63b7eda92f1b0499635b1f5e549",
+        "artifact_sha256": "855d3af801b8b581b2082ac11a7779be14399c6c193668da21c01154ed257714",
+        "validation": "9/9 showcase, 0 errors, 0 warnings",
+        "browser_evidence": "passed",
+        "viewports": [
+          [
+            1440,
+            900
+          ],
+          [
+            1600,
+            1000
+          ],
+          [
+            1920,
+            1080
+          ],
+          [
+            2048,
+            1320
+          ]
+        ],
+        "visual_review": "passed",
+        "review_scope": "已查看 2048×1320 浅色与 1440×900 深色截图；节点、标签与关系无截断或遮挡。",
+        "correction_rounds": 2
+      }
+    },
+    {
+      "id": "harbor-samples",
+      "kind": "evidence-extract",
+      "sources": [
+        "src-harbor-samples"
+      ],
+      "purpose": "核对两份历史 trial 的有限事实，不表示本轮复跑或完整平台成绩。",
+      "files": [
+        {
+          "path": "agent/evidence/harbor-samples.json",
+          "sha256": "6992f897e9c9653beb92f7b3cc3af7605be19715ab433ea52301cd90f3c00e8b",
+          "bytes": 1907
+        }
+      ],
+      "created": "2026-10-08",
+      "origin": "本地已有 result.json 与 verifier 输出的字段白名单提取，原始文件摘要随证据保存。",
+      "public_scope": "仅任务名、版本、时间、结果与原文件摘要；无原始配置、端点或凭据。"
+    }
+  ]
+}

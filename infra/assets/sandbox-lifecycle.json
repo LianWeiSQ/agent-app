@@ -1,0 +1,148 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "沙箱从申请到回收 · 设计说明",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "control",
+      "label": "资源管理"
+    },
+    {
+      "id": "runtime",
+      "label": "隔离执行"
+    },
+    {
+      "id": "retention",
+      "label": "成果与回收"
+    }
+  ],
+  "mainPath": [
+    "intent",
+    "select",
+    "allocate",
+    "ready",
+    "command",
+    "artifact",
+    "release"
+  ],
+  "nodes": [
+    {
+      "id": "intent",
+      "lane": "control",
+      "col": 0,
+      "type": "backend",
+      "label": "申请执行环境",
+      "sublabel": "租户 · 配置 · 有效期",
+      "width": 148
+    },
+    {
+      "id": "select",
+      "lane": "control",
+      "col": 1,
+      "type": "backend",
+      "label": "选择创建路径",
+      "sublabel": "匹配预热或模板创建",
+      "width": 148
+    },
+    {
+      "id": "allocate",
+      "lane": "control",
+      "col": 2,
+      "type": "cloud",
+      "label": "分配运行资源",
+      "sublabel": "资源声明 → Pod",
+      "width": 148
+    },
+    {
+      "id": "ready",
+      "lane": "runtime",
+      "col": 2,
+      "type": "security",
+      "label": "验证可执行",
+      "sublabel": "代理健康 · 命令 · 文件",
+      "width": 148
+    },
+    {
+      "id": "command",
+      "lane": "runtime",
+      "col": 3,
+      "type": "backend",
+      "label": "绑定并执行",
+      "sublabel": "沙箱标识 · 命令标识",
+      "width": 148
+    },
+    {
+      "id": "artifact",
+      "lane": "retention",
+      "col": 3,
+      "type": "database",
+      "label": "确认保留成果",
+      "sublabel": "文件 · 校验 · 权限",
+      "width": 148
+    },
+    {
+      "id": "release",
+      "lane": "retention",
+      "col": 4,
+      "type": "cloud",
+      "label": "释放并对账",
+      "sublabel": "实际回收后归还额度",
+      "width": 148
+    }
+  ],
+  "edges": [
+    {
+      "from": "intent",
+      "to": "select",
+      "label": "检查配置"
+    },
+    {
+      "from": "select",
+      "to": "allocate",
+      "label": "提交期望"
+    },
+    {
+      "from": "allocate",
+      "to": "ready",
+      "label": "等待就绪"
+    },
+    {
+      "from": "ready",
+      "to": "command",
+      "label": "通过检查",
+      "variant": "security"
+    },
+    {
+      "from": "command",
+      "to": "artifact",
+      "label": "结束或长等待"
+    },
+    {
+      "from": "artifact",
+      "to": "release",
+      "label": "确认可回收"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "两条生命周期分开",
+      "items": [
+        "Turn 保存任务目标和进度；沙箱承载命令与文件。",
+        "短等待可保留，长等待是否回收取决于后端恢复能力。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "本图是设计与验收视角",
+      "items": [
+        "Pod Ready 不等于命令可执行；恢复文件不等于恢复进程。",
+        "不承诺任一产品已完整实现本图全部门禁。"
+      ]
+    }
+  ]
+}

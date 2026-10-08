@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "artifacts": [
+    {
+      "id": "sandbox-lifecycle",
+      "kind": "illustration",
+      "sources": [
+        "src-feishu-agent-infra"
+      ],
+      "purpose": "解释创建、预热、就绪、执行、成果保留和回收的验收顺序。",
+      "files": [
+        {
+          "path": "infra/assets/sandbox-lifecycle.json",
+          "sha256": "9181d004b04d41b1a8b3f4c63eb5b0e2f82ab1c7f4bad2bff1784085de439c9a",
+          "bytes": 3126
+        },
+        {
+          "path": "infra/assets/sandbox-lifecycle.html",
+          "sha256": "879ac8112882a49df1c2c77a1d470ae98980f3e7701a1c4ec2eb3e0a820f9290",
+          "bytes": 709312
+        },
+        {
+          "path": "infra/assets/sandbox-lifecycle.visual-check.2048x1320.light.png",
+          "sha256": "c861024b4609c4622d4e6c9e0d3be7b282dfd509342a2e41f7199944f9bc3eb7",
+          "bytes": 163575
+        }
+      ],
+      "created": "2026-10-08",
+      "origin": "依据已读取材料重新绘制，Archify 2.17 渲染；非原始产品截图。",
+      "public_scope": "仅包含抽象流程，无内部部署、地址、权限缺口或用户数据。",
+      "checks": {
+        "diagram_type": "workflow",
+        "output": "infra/assets/sandbox-lifecycle.html",
+        "specification_sha256": "9181d004b04d41b1a8b3f4c63eb5b0e2f82ab1c7f4bad2bff1784085de439c9a",
+        "artifact_sha256": "879ac8112882a49df1c2c77a1d470ae98980f3e7701a1c4ec2eb3e0a820f9290",
+        "validation": "9/9 showcase, 0 errors, 0 warnings",
+        "browser_evidence": "passed",
+        "viewports": [
+          [
+            1440,
+            900
+          ],
+          [
+            1600,
+            1000
+          ],
+          [
+            1920,
+            1080
+          ],
+          [
+            2048,
+            1320
+          ]
+        ],
+        "visual_review": "passed",
+        "review_scope": "已查看 2048×1320 浅色与 1440×900 深色截图；节点、标签与关系无截断或遮挡。",
+        "correction_rounds": 2
+      }
+    }
+  ]
+}

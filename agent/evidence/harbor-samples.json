@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "reviewed_on": "2026-10-08",
+  "evidence_kind": "sanitized-local-run-record-extract",
+  "rerun": false,
+  "scope": "Two historical local trials; not a benchmark score or product production metric.",
+  "omitted": ["credentials", "network endpoints", "raw trace", "local paths", "run identifiers", "full configuration"],
+  "samples": [
+    {
+      "task": "terminal-bench/openssl-selfsigned-cert",
+      "started_at": "2026-09-09T04:53:28.590670Z",
+      "finished_at": "2026-09-09T04:59:30.756619Z",
+      "harness": "deepseek-harness",
+      "harness_version": "0.1.2-rc.1",
+      "model_recorded_name": "gpt-5.6-sol",
+      "environment": "docker",
+      "verifier_environment_mode": "shared",
+      "reward": 1.0,
+      "verifier_tests_passed": 6,
+      "exception_type": null,
+      "durations_seconds_rounded": {"total": 362, "agent_setup": 170, "agent_execution": 178},
+      "verifier_tests": ["test_directory_structure", "test_key_file", "test_certificate_file", "test_combined_pem_file", "test_verification_file", "test_python_verification_script"],
+      "source_hashes": {
+        "result_json_sha256": "0ee05b41be6489ac2788fde43f8c709dffcf522fad6f8e4d5c43d5153da224a7",
+        "verifier_stdout_sha256": "b4bed97850abc3688cd780b8c0717556fc5f186ed50573eab87b8fe7394e5ce7"
+      }
+    },
+    {
+      "task": "terminal-bench/fix-git",
+      "started_at": "2026-09-10T03:09:25.789451Z",
+      "finished_at": "2026-09-10T03:12:46.332960Z",
+      "environment": "docker",
+      "agent_setup_recorded": true,
+      "agent_execution": null,
+      "verifier": null,
+      "verifier_result": null,
+      "exception_type": "NetworkConnectionError",
+      "interpretation": "Setup/infrastructure failure; no recorded agent execution or verifier result.",
+      "source_hashes": {"result_json_sha256": "926e01f9e377c2a78f97ad335f5a6bce484332c8daec58a398218ec679202c99"}
+    }
+  ]
+}

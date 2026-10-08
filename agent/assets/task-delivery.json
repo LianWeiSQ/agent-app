@@ -1,0 +1,167 @@
+{
+  "schema_version": 2,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "从用户任务到文件成果 · 架构说明",
+    "locale": "zh-CN",
+    "quality_profile": "showcase"
+  },
+  "lanes": [
+    {
+      "id": "service",
+      "label": "产品与任务"
+    },
+    {
+      "id": "execution",
+      "label": "工具与执行环境"
+    },
+    {
+      "id": "result",
+      "label": "结果与交付"
+    },
+    {
+      "id": "handoff",
+      "label": "用户成果"
+    }
+  ],
+  "mainPath": [
+    "request",
+    "session",
+    "reason",
+    "policy",
+    "execute",
+    "files",
+    "check",
+    "delivery"
+  ],
+  "nodes": [
+    {
+      "id": "request",
+      "lane": "service",
+      "col": 0,
+      "type": "frontend",
+      "label": "提交目标与资料",
+      "sublabel": "任务输入",
+      "width": 148
+    },
+    {
+      "id": "session",
+      "lane": "service",
+      "col": 1,
+      "type": "backend",
+      "label": "会话与配置",
+      "sublabel": "身份 · 模板 · 工作区",
+      "width": 148
+    },
+    {
+      "id": "reason",
+      "lane": "service",
+      "col": 2,
+      "type": "backend",
+      "label": "Harness 推进",
+      "sublabel": "上下文 · 模型 · 下一步",
+      "width": 148
+    },
+    {
+      "id": "policy",
+      "lane": "execution",
+      "col": 2,
+      "type": "security",
+      "label": "工具执行前检查",
+      "sublabel": "参数 · 权限 · 预算",
+      "width": 148
+    },
+    {
+      "id": "execute",
+      "lane": "execution",
+      "col": 3,
+      "type": "cloud",
+      "label": "沙箱执行",
+      "sublabel": "命令 · 文件 · 资源限制",
+      "width": 148
+    },
+    {
+      "id": "files",
+      "lane": "result",
+      "col": 3,
+      "type": "database",
+      "label": "结果与工作文件",
+      "sublabel": "退出码 · 输出 · 文件引用",
+      "width": 148
+    },
+    {
+      "id": "check",
+      "lane": "result",
+      "col": 4,
+      "type": "backend",
+      "label": "检查是否完成",
+      "sublabel": "未完成则继续推理",
+      "width": 148
+    },
+    {
+      "id": "delivery",
+      "lane": "handoff",
+      "col": 4,
+      "type": "frontend",
+      "label": "交付可用成果",
+      "sublabel": "进度 · 预览 · 下载",
+      "width": 148
+    }
+  ],
+  "edges": [
+    {
+      "from": "request",
+      "to": "session",
+      "label": "受理"
+    },
+    {
+      "from": "session",
+      "to": "reason",
+      "label": "启动任务"
+    },
+    {
+      "from": "reason",
+      "to": "policy",
+      "label": "需要工具"
+    },
+    {
+      "from": "policy",
+      "to": "execute",
+      "label": "获准执行",
+      "variant": "security"
+    },
+    {
+      "from": "execute",
+      "to": "files",
+      "label": "返回结果"
+    },
+    {
+      "from": "files",
+      "to": "check",
+      "label": "回填任务"
+    },
+    {
+      "from": "check",
+      "to": "delivery",
+      "label": "满足验收"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "三个产品，分别验收",
+      "items": [
+        "智算云：云侧通用任务；AI4S：科研交付；YiBuddy：工作助手。",
+        "本图抽象共性链路，不表示三个产品共用同一套部署。"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "图的证据边界",
+      "items": [
+        "依据项目准备材料重新绘制，不是产品实拍或运行证明。",
+        "完整恢复、权限与资源策略须对应具体版本和验收记录。"
+      ]
+    }
+  ]
+}

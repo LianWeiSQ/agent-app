@@ -3,7 +3,7 @@ id: "agent-eval"
 title: "Harbor 评测：怎样证明 Agent 真的变好"
 type: "topic"
 tags: ["agent","evaluation","sandbox"]
-sources: ["src-agent-session","src-public-agent"]
+sources: ["src-agent-session","src-public-agent", "src-feishu-interview", "src-harbor-samples"]
 confidence: "inferred"
 status: "design"
 updated: "2026-10-08"
@@ -20,6 +20,10 @@ updated: "2026-10-08"
 总分只是入口。需要知道什么类型的问题变化了，是系统真正更可靠，还是环境、预算和任务选择变了。
 
 ## 一次 trial 怎样走完？
+
+![一次评测到版本改进的方法图](assets/evaluation-loop.visual-check.2048x1320.light.png)
+
+图 3：前半段对应任务评测链路，后半段是持续改进方法，不代表已经自动实现 RSI。[交互图，下载后打开](assets/evaluation-loop.html)。
 
 任务定义给出目标和输入，环境提供隔离工作区，被测 Agent 通过适配器执行。保存轨迹与产物，运行独立验证逻辑，再汇总结果和清理资源。
 
@@ -61,6 +65,21 @@ updated: "2026-10-08"
 “用户使用得更多”不会自动令系统更好。要先获得反馈使用授权、清理敏感信息，再把失败变成有输入、标准和证据的用例。
 
 ## 最小评测记录
+
+### 已核对的两个本地样本
+
+2026-10-08 核对了两份已有结果与成功样本的 verifier 输出，并保存[脱敏证据](sources/Harbor样本核对.md)。不是本轮重新运行的结果。
+
+| 样本 | 记录中的结果 | 对工程判断的帮助 |
+| --- | --- | --- |
+| OpenSSL 自签证书任务 | 本地 Docker；6 项测试通过，reward 1.0 | 证明该次安装、执行、收集与判分链路跑通 |
+| fix-git 任务 | 安装阶段网络异常；没有 Agent 执行与判分结果 | 环境失败要保留，但不能归为模型任务能力失败 |
+
+成功样本用的是 deepseek-harness 0.1.2-rc.1，模型记录名称为 gpt-5.6-sol，不能混淆 Harness 与模型身份。总耗时约 362 秒，其中准备约 170 秒、执行约 178 秒；这些时间来自单次阶段记录，不是平均值或 P95。它提示应先看安装与执行分别占多少，再决定优化位置。
+
+这些本地 Docker 样本也不证明已经在平台沙箱完成适配。远端接入应另外做同任务的执行、文件、验证与清理对照。完整失败归因、受保护判分环境与规模化回归仍需独立验收。
+
+### 后续记录模板
 
 ```text
 任务/数据版本：

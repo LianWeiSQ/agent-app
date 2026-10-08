@@ -3,7 +3,7 @@ id: "agent-index"
 title: "Agent：任务怎样可靠完成"
 type: "index"
 tags: ["agent","runtime","interview"]
-sources: ["src-agent-session"]
+sources: ["src-agent-session", "src-feishu-interview", "src-feishu-project-story"]
 confidence: "inferred"
 status: "reference"
 updated: "2026-10-08"
@@ -11,7 +11,13 @@ updated: "2026-10-08"
 
 # Agent
 
-这里从任务执行出发，不按框架名称排列。初版是会话总结与学习底稿，不是对项目所有功能的交付认定。
+这里从任务执行出发，不按框架名称排列。项目经历、技术方案和研究兴趣分别组织，不把三者混写成已交付功能。
+
+## 第一层 项目与经历
+
+[个人主线](01-项目与个人主线.md) → [项目总览](projects/README.md) → [智算云](projects/智算云.md) / [AI4S](projects/AI4S.md) / [YiBuddy](projects/YiBuddy.md)。先理解产品为什么存在，再选择技术专题。
+
+## 第二层 技术主文
 
 | 章节 | 要回答的问题 |
 | --- | --- |
@@ -31,3 +37,11 @@ updated: "2026-10-08"
 [会话摘要](sources/会话摘要.md)记录经历陈述、问题演进和待补证据；[公开参考](sources/公开参考.md)给出核对入口。正文是整理后的解释，不能反向当作“这些能力都已经上线”的证据。
 
 执行资源转到 [Infra](../infra/README.md)。任务恢复与资源恢复分别阅读，避免把工作区保存说成进程续跑。
+
+## 第三层 面试复习
+
+[10 分钟到系统复习的路线](interview/README.md)包含原题映射；[开场与项目](interview/01-开场与项目问答.md)练口头表达；[Harness 追问](interview/02-Harness追问.md)练机制与边界。岗位方向仍见第 09 章，不与技术问答混在一起。
+
+## 第四层 证据与维护
+
+[口径冲突和补证清单](interview/03-事实边界与证据.md) · [总手册来源](sources/飞书总手册摘要.md) · [项目答辩来源](sources/飞书项目答辩摘要.md) · [Harbor 样本核对](sources/Harbor样本核对.md) · [配图说明](assets/README.md)。

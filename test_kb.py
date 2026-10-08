@@ -1,5 +1,6 @@
 """Self-tests for the documentation validator; no network or external services."""
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,48 @@ class KnowledgeBaseTests(unittest.TestCase):
     def test_wrong_list_type_does_not_crash(self):
         self.write("agent/topic.md", document("agent-test", sources="src-test"))
         self.assertTrue(any("string list" in e for e in self.errors()))
+
+    def add_artifact(self):
+        content = '{"result": "pass"}\n'
+        self.write("agent/evidence/example.json", content)
+        entry = {
+            "id": "sample", "kind": "evidence-extract", "sources": ["src-test"],
+            "created": "2026-10-08", "origin": "test fixture", "purpose": "validator test",
+            "public_scope": "synthetic sample",
+            "files": [{"path": "agent/evidence/example.json", "bytes": len(content.encode()),
+                       "sha256": hashlib.sha256(content.encode()).hexdigest()}],
+        }
+        self.write("agent/assets/manifest.json", json.dumps({"schema_version": 1, "artifacts": [entry]}))
+        return entry
+
+    def test_artifact_hash_and_valid_manifest(self):
+        self.add_artifact()
+        self.assertEqual(self.errors(), [])
+        self.write("agent/evidence/example.json", '{"result": "changed"}')
+        self.assertTrue(any("hash or byte count mismatch" in e for e in self.errors()))
+
+    def test_unregistered_artifact(self):
+        self.write("infra/assets/unknown.svg", "<svg/>")
+        self.assertTrue(any("missing from manifest" in e for e in self.errors()))
+
+    def test_artifact_source_and_privacy(self):
+        entry = self.add_artifact()
+        entry["sources"] = ["src-missing"]
+        entry["origin"] = "https://private.feishu.cn/wiki/secret"
+        self.write("agent/assets/manifest.json", json.dumps({"schema_version": 1, "artifacts": [entry]}))
+        errors = self.errors()
+        self.assertTrue(any("unresolved artifact source" in e for e in errors))
+        self.assertTrue(any("private Feishu" in e for e in errors))
+
+    def test_artifact_path_escape(self):
+        entry = self.add_artifact()
+        entry["files"][0]["path"] = "../outside.json"
+        self.write("agent/assets/manifest.json", json.dumps({"schema_version": 1, "artifacts": [entry]}))
+        self.assertTrue(any("unsafe artifact file" in e for e in self.errors()))
+
+    def test_invalid_manifest_shape(self):
+        self.write("agent/assets/manifest.json", "[]")
+        self.assertTrue(any("invalid manifest schema" in e for e in self.errors()))
 
 
 if __name__ == "__main__":

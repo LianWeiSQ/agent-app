@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import re
 from collections import defaultdict
@@ -106,6 +107,75 @@ def index_content(pages: dict[str, dict]) -> str:
             f'[{table_text(m["title"])}]({path}) |'
         )
     return "\n".join(out).rstrip() + "\n"
+
+
+def validate_artifacts(root: Path, source_ids: set[str]) -> list[str]:
+    """Check public artifact provenance and byte identity, not product claims."""
+    errors, recorded, identifiers = [], set(), set()
+    for area in ("agent", "infra"):
+        manifest = root / area / "assets" / "manifest.json"
+        if not manifest.exists():
+            continue
+        label = manifest.relative_to(root).as_posix()
+        try:
+            manifest_text = manifest.read_text(encoding="utf-8")
+            for name, pattern in PRIVATE_PATTERNS.items():
+                if pattern.search(manifest_text):
+                    errors.append(f"{label}: possible {name}; review before publishing")
+            data = json.loads(manifest_text)
+            if not isinstance(data, dict) or data.get("schema_version") != 1 or not isinstance(data.get("artifacts"), list):
+                raise ValueError("invalid manifest schema")
+            for entry in data["artifacts"]:
+                if not isinstance(entry, dict):
+                    raise ValueError("artifact must be an object")
+                artifact_id = entry.get("id")
+                if not isinstance(artifact_id, str) or not artifact_id or artifact_id in identifiers:
+                    raise ValueError("missing or duplicate artifact id")
+                identifiers.add(artifact_id)
+                if entry.get("kind") not in {"illustration", "evidence-extract", "product-screenshot"}:
+                    raise ValueError("invalid artifact kind")
+                refs = entry.get("sources")
+                if not isinstance(refs, list) or not refs or any(not isinstance(s, str) or s not in source_ids for s in refs):
+                    raise ValueError("unresolved artifact source")
+                for field in ("origin", "purpose", "public_scope"):
+                    if not isinstance(entry.get(field), str) or not entry[field]:
+                        raise ValueError(f"missing artifact {field}")
+                dt.date.fromisoformat(entry["created"])
+                files = entry.get("files")
+                if not isinstance(files, list) or not files:
+                    raise ValueError("artifact requires files")
+                for item in files:
+                    rel = item["path"]
+                    if not isinstance(rel, str) or Path(rel).is_absolute():
+                        raise ValueError("unsafe artifact path")
+                    target = (root / rel).resolve()
+                    if not target.is_relative_to(root) or not target.is_file() or (root / rel).is_symlink():
+                        raise ValueError("missing or unsafe artifact file")
+                    if rel in recorded:
+                        raise ValueError("duplicate artifact file")
+                    recorded.add(rel)
+                    raw = target.read_bytes()
+                    if hashlib.sha256(raw).hexdigest() != item.get("sha256") or len(raw) != item.get("bytes"):
+                        errors.append(f"{rel}: artifact hash or byte count mismatch")
+                    if target.suffix == ".json":
+                        for name, pattern in PRIVATE_PATTERNS.items():
+                            if pattern.search(raw.decode("utf-8")):
+                                errors.append(f"{rel}: possible {name}; review before publishing")
+        except (ValueError, TypeError, KeyError, UnicodeError, OSError) as exc:
+            errors.append(f"{label}: {exc}")
+    for area in ("agent", "infra"):
+        for folder in ("assets", "evidence"):
+            for path in (root / area / folder).glob("*"):
+                if not path.is_file() or path.suffix not in {".json", ".html", ".png", ".svg", ".jpg", ".webp"}:
+                    continue
+                if path.name == "manifest.json":
+                    continue
+                if ".visual-check." in path.name and not path.name.endswith(".2048x1320.light.png"):
+                    continue  # Private local browser receipts and alternate QA captures.
+                rel = path.relative_to(root).as_posix()
+                if rel not in recorded:
+                    errors.append(f"{rel}: artifact missing from manifest")
+    return errors
 
 
 def validate(root: Path, check_index: bool = True) -> tuple[list[str], list[str], dict]:
@@ -216,6 +286,7 @@ def validate(root: Path, check_index: bool = True) -> tuple[list[str], list[str]
                 if not check_index and target == root / "INDEX.md":
                     continue
                 errors.append(f"{rel}: broken link {url}")
+    errors.extend(validate_artifacts(root, {m["id"] for m in pages.values() if m["type"] == "source"}))
     if check_index and not errors:
         index = root / "INDEX.md"
         if not index.exists() or index.read_text(encoding="utf-8") != index_content(pages):
@@ -239,7 +310,7 @@ def main() -> int:
         (root / "INDEX.md").write_text(index_content(pages), encoding="utf-8")
         print("Updated INDEX.md")
     topics = sum(m["type"] in {"topic", "plan"} for m in pages.values())
-    print(f"OK: {len(pages)} knowledge pages, {topics} topics; metadata, sources, local links and privacy checks passed.")
+    print(f"OK: {len(pages)} knowledge pages, {topics} topics; metadata, sources, local links, artifact hashes and privacy checks passed.")
     print("Limits: does not verify technical claims, external URLs, heading fragments or all possible sensitive data.")
     return 0
 

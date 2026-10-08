@@ -3,7 +3,7 @@ id: "infra-index"
 title: "Infra：模型和执行环境怎样运行"
 type: "index"
 tags: ["infra","inference","sandbox"]
-sources: ["src-infra-session"]
+sources: ["src-infra-session", "src-feishu-agent-infra"]
 confidence: "inferred"
 status: "reference"
 updated: "2026-10-08"
@@ -12,6 +12,12 @@ updated: "2026-10-08"
 # Infra
 
 沿着一条 Agent 任务往下看：调用模型的请求会进入推理服务，执行代码的请求会进入沙箱；两种负载可以同时存在，但生命周期和资源需求不同。
+
+## 执行资源主线
+
+先看[沙箱总论](05-沙箱与执行资源.md)，再进入[创建、预热与就绪](sandbox/01-创建预热与就绪.md)、[命令、文件与恢复](sandbox/02-命令文件与恢复.md)。面试前看[执行资源十二问](interview/01-执行资源答辩.md)，来源记录见[Agent-Infra 摘要](sources/飞书Agent-Infra摘要.md)。
+
+## 推理与基础设施主线
 
 | 章节 | 要回答的问题 |
 | --- | --- |
@@ -26,4 +32,4 @@ updated: "2026-10-08"
 
 [会话摘要](sources/会话摘要.md)保留哪些是教学示例、哪些仍待实践；[公开参考](sources/公开参考.md)提供官方资料入口。
 
-这一部分目前是学习与设计总结，不能据此声称本人已运营多卡推理、物理 P/D 分离或大规模 GPU 集群。资源侧恢复要结合 [Agent 任务状态](../agent/03-持久状态与故障恢复.md)一起理解。
+推理部分目前以学习与设计总结为主，不能据此声称本人已运营多卡推理、物理 P/D 分离或大规模 GPU 集群。执行资源部分结合项目接入材料，但完整恢复与治理仍按版本验收。资源侧恢复要结合 [Agent 任务状态](../agent/03-持久状态与故障恢复.md)一起理解。
