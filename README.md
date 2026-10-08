@@ -1,71 +1,63 @@
-# OpenAgent App
+# 廉威的 Agent / Infra 知识库
 
-This directory is the product app surface for OpenAgent.
+把做过的项目、讨论过的方案和还在补的知识放到一起。不是技术名词清单，也不把学习笔记写成生产经历。
 
-The app is intentionally outside the `openharness` core workspace. It owns:
+目前有两条主线：
 
-- React/Tauri desktop UI
-- local desktop commands such as file and folder attachment picking
-- managed Bridge process lifecycle
-- packaged app resources and smoke scripts
+| 入口 | 主要解决什么问题 |
+| --- | --- |
+| [Agent](agent/README.md) | 一个任务怎样被理解、执行、验证，并在出错后正确继续 |
+| [Infra](infra/README.md) | 模型和代码在哪里运行，资源怎样分配，性能与隔离怎样验证 |
 
-The core workspace remains in `../openharness` and owns:
+[按问题、标签、来源和更新时间检索](INDEX.md) · [维护方法](MAINTENANCE.md) · [更新记录](CHANGELOG.md)
 
-- Agent runtime
-- session store
-- tool execution
-- MCP runtime
-- provider/runtime integration
+## 从哪里开始读
 
-The app talks to the core through the Bridge HTTP/SSE API. During packaged builds it builds and bundles the runtime sidecar from `../openharness`.
+**面试前快速回顾：** [个人与项目主线](agent/01-项目与个人主线.md) → [恢复与副作用](agent/03-持久状态与故障恢复.md) → [Harbor 评测](agent/07-Harbor评测与持续改进.md) → [沙箱生命周期](infra/05-沙箱与执行资源.md)。
 
-The harness/core root is configurable from Desktop Settings. By default it
-uses `../openharness`; `OPENAGENT_CORE_ROOT` remains the process-level fallback,
-and the UI setting is passed to the managed Bridge as `coreRoot`.
+**补 Infra 基础：** [一次推理请求](infra/01-一次推理请求.md) → [vLLM 单实例](infra/02-vLLM单实例.md) → [Pod、GPU 与副本](infra/03-GPU与模型部署.md) → [路由与 P/D 分离](infra/04-路由与PD分离.md)。
 
-The current product status and roadmap live in
-`docs/desktop-agentic-workspace-plan.md`, next to the app that owns them.
-The legacy static bridge console lives in `static/bridge-console/` for
-reference and app-side experiments; it is no longer embedded in core.
+**准备 AI 测试开发：** [岗位判断与面试策略](agent/09-面试与职业选择.md) → [Harbor 评测](agent/07-Harbor评测与持续改进.md) → [容量与故障定位](infra/07-容量压测与故障定位.md)。
 
-Provider configuration is intentionally local-only. The desktop app starts the
-Bridge sidecar from `../openharness` and injects provider env into that child
-process from the first existing file in this order:
+## 内容从哪里来
 
-1. `OPENAGENT_PROVIDER_ENV_FILE`
-2. `OPENAGENT_ENV_FILE`
-3. `<workspace>/.openagent/openagent.env`
-4. `app/.openagent/openagent.env`
-5. `../openharness/.openagent/openagent.env`
-6. `~/.openagent/openagent.env`
+初版整理自两个会话：**last dance** 与 **last dance -infra**，并参考已有本地面试稿。这里保存经过筛选和修订的主题总结，不是聊天逐字稿，也不是对全部历史工具输出的完整归档。两份[Agent 会话摘要](agent/sources/会话摘要.md)和[Infra 会话摘要](infra/sources/会话摘要.md)保留了讨论脉络与修正记录。
 
-Create an ignored local file such as `app/.openagent/openagent.env`:
+这次整理统一了几处容易混淆的口径：
 
-```bash
-mkdir -p /Users/william/coding/harness/app/.openagent
-chmod 700 /Users/william/coding/harness/app/.openagent
-$EDITOR /Users/william/coding/harness/app/.openagent/openagent.env
-```
+- 经历顺序是 Go 云服务 → 云端 AI / 自研 Harness → YiBuddy 端侧 Agent。
+- 项目分为 YiBuddy、智算云和 AI4S；科研是垂类，不代表全部平台场景。
+- 状态持久化、自动接管、副作用去重是不同能力。
+- 沙箱资源恢复，不等于进程内存和外部副作用无损恢复。
+- vLLM 的部署示例与容量推导，不是本人已经运营过的 GPU 集群成果。
+- 基于 Harbor 的评测实践，与“用 Agent 改进软件测试”有交集，但不是同一件事。
+- RSI / 论文属于研究兴趣，暂不当作面试中的已交付成果。
 
-Use OpenAI-compatible keys without committing the file:
+## 如何看待文中的“我”
 
-```dotenv
-OPENAI_API_KEY=<your-api-key>
-OPENAI_BASE_URL=<your-openai-compatible-base-url>
-OPENAI_MODEL=gpt-5.5
-OPENAGENT_MODEL=gpt-5.5
-OPENAI_WIRE_API=responses
-OPENAGENT_PROVIDER_STREAM=1
-```
+第一人称只用于本人陈述过的经历或明确标注的回答草稿。涉及数量、性能收益、生产规模、亲自完成的模块，必须有单独证据；目前没有的数据就写“待补”。
 
-If no model is set, the app defaults the managed Bridge to `gpt-5.5`.
+每页带有来源、状态和更新时间。尤其留意：
 
-Useful commands:
+- **实践陈述**：本人或已有记录描述过，不代表已独立核验所有交付细节。
+- **设计方案**：可讨论和验证的方案，不是已上线承诺。
+- **学习笔记 / 学习计划**：用于建立理解，不能替代实操记录。
+- **公开参考**：阅读原文时仍需核对版本。
+
+## 公开边界
+
+不上传内部代码、公司私有架构原图、未公开安全缺口、飞书访问链接、原始会话、他人简历评价、联系方式、服务器地址、密钥和客户数据。涉及项目的部分只保留高层角色与通用技术方法，不代表公司官方材料。
+
+## 仓库迁移
+
+2026-10-08 起，本仓库主分支由旧桌面应用改为知识库；仓库名称暂不变。
+
+旧应用保留在 [archive/app-before-kb-2026-10-08](https://github.com/LianWeiSQ/agent-app/tree/archive/app-before-kb-2026-10-08)，基线提交为 `3f29065e740a1d9d0b05308b26b28ce41034fc62`。迁移通过普通提交完成，不重写历史。
+
+本库不需要 Node、Rust、数据库或向量服务。维护校验只需 Python 3.10+：
 
 ```bash
-npm --prefix /Users/william/coding/harness/app run build
-npm --prefix /Users/william/coding/harness/app run core:runtime
-npm --prefix /Users/william/coding/harness/app run tauri -- build --bundles app
+python3 kb.py
+python3 kb.py --write-index
+python3 -m unittest -v test_kb.py
 ```
-
-Set `OPENAGENT_CORE_ROOT` when the core workspace is not at `../openharness`.
